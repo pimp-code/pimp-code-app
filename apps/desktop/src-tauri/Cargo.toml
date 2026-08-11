@@ -1,7 +1,7 @@
 [package]
 name = "pimp-code-desktop"
 version = "0.0.0"
-description = "Tauri feasibility spike for Pimp Code"
+description = "Plan-only Tauri desktop slice for Pimp Code"
 authors = ["Pimp Code contributors"]
 edition = "2024"
 

@@ -2,9 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
@@ -15,6 +19,11 @@ use tokio::{
 };
 use uuid::Uuid;
 
+const MAX_UTILITY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AGENT_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SKILL_ROOTS: usize = 16;
+const MAX_SKILL_ROOT_LENGTH: usize = 2_000;
+
 #[derive(Default)]
 struct AgentProcessState {
     active: Mutex<Option<ActiveAgent>>,
@@ -22,6 +31,7 @@ struct AgentProcessState {
 
 #[derive(Clone)]
 struct ActiveAgent {
+    cancellation_requested: Arc<AtomicBool>,
     run_id: String,
     stdin: Arc<Mutex<ChildStdin>>,
     pid: u32,
@@ -41,6 +51,30 @@ struct AgentStartRequest {
 enum ProviderConfig {
     Claude { model: String },
     Local { model: String, endpoint: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanStartRequest {
+    preflight_id: String,
+    max_turns: u8,
+    provider: ProviderConfig,
+    remote_egress_approved: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillRootsSettings {
+    version: u8,
+    roots: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UtilityResponse {
+    ok: bool,
+    data: Option<Value>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -67,9 +101,26 @@ fn node_compatible_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn host_script_path() -> Result<PathBuf, String> {
+fn host_entry_path(app: &AppHandle, entry: &str) -> Result<PathBuf, String> {
+    if !matches!(entry, "cli.js" | "utility-cli.js") {
+        return Err("Unknown agent-host entry point".to_string());
+    }
+
+    #[cfg(debug_assertions)]
+    let _ = app;
+
+    #[cfg(not(debug_assertions))]
+    let path = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("Could not resolve packaged resources: {error}"))?
+        .join("runtime/agent-host")
+        .join(entry.replace(".js", ".mjs"));
+
+    #[cfg(debug_assertions)]
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../packages/agent-host/dist/src/cli.js");
+        .join("../../../packages/agent-host/dist/src")
+        .join(entry);
     let canonical = path
         .canonicalize()
         .map_err(|error| format!("Agent host is not built at {}: {error}", path.display()))?;
@@ -84,6 +135,68 @@ fn host_script_path() -> Result<PathBuf, String> {
     // Windows canonicalization returns a verbatim path (`\\?\C:\...`). Node 26
     // cannot use that form for its main script and resolves it as the `C:` directory.
     Ok(node_compatible_path(&canonical))
+}
+
+fn host_script_path(app: &AppHandle) -> Result<PathBuf, String> {
+    host_entry_path(app, "cli.js")
+}
+
+fn utility_script_path(app: &AppHandle) -> Result<PathBuf, String> {
+    host_entry_path(app, "utility-cli.js")
+}
+
+fn node_runtime_path(app: &AppHandle) -> Result<PathBuf, String> {
+    #[cfg(debug_assertions)]
+    {
+        let _ = app;
+        Ok(PathBuf::from("node"))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let path = app
+            .path()
+            .resource_dir()
+            .map_err(|error| format!("Could not resolve packaged resources: {error}"))?
+            .join("runtime/node.exe")
+            .canonicalize()
+            .map_err(|error| format!("Packaged Node runtime is unavailable: {error}"))?;
+        Ok(node_compatible_path(&path))
+    }
+}
+
+fn claude_runtime_path(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    #[cfg(debug_assertions)]
+    {
+        let _ = app;
+        Ok(None)
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let path = app
+            .path()
+            .resource_dir()
+            .map_err(|error| format!("Could not resolve packaged resources: {error}"))?
+            .join("runtime/claude.exe")
+            .canonicalize()
+            .map_err(|error| format!("Packaged Claude Code runtime is unavailable: {error}"))?;
+        Ok(Some(node_compatible_path(&path)))
+    }
+}
+
+fn runtime_working_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
+        .join("runtime");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+    directory
+        .canonicalize()
+        .map(|path| node_compatible_path(&path))
+        .map_err(|error| format!("Could not resolve {}: {error}", directory.display()))
 }
 
 fn minimal_environment() -> HashMap<String, String> {
@@ -114,6 +227,264 @@ fn minimal_environment() -> HashMap<String, String> {
         .collect()
 }
 
+fn utility_environment(request: &Value) -> HashMap<String, String> {
+    let mut environment = minimal_environment();
+    let operation = request.get("operation").and_then(Value::as_str);
+    let provider_kind = request
+        .get("provider")
+        .and_then(Value::as_object)
+        .and_then(|provider| provider.get("kind"))
+        .and_then(Value::as_str);
+    match (operation, provider_kind) {
+        (Some("provider_health"), Some("claude")) => {
+            environment.remove("LOCAL_LLM_API_KEY");
+        }
+        (Some("provider_health"), Some("local")) => {
+            environment.remove("ANTHROPIC_API_KEY");
+        }
+        _ => {
+            environment.remove("ANTHROPIC_API_KEY");
+            environment.remove("LOCAL_LLM_API_KEY");
+        }
+    }
+    environment
+}
+
+fn sanitize_diagnostic(message: impl Into<String>) -> String {
+    let mut result = message.into();
+    for key in ["ANTHROPIC_API_KEY", "LOCAL_LLM_API_KEY"] {
+        if let Ok(secret) = std::env::var(key)
+            && !secret.is_empty()
+        {
+            result = result.replace(&secret, "[REDACTED]");
+        }
+    }
+    result.chars().take(4_000).collect()
+}
+
+fn normalize_skill_roots(roots: Vec<String>) -> Result<Vec<String>, String> {
+    if roots.len() > MAX_SKILL_ROOTS {
+        return Err(format!("At most {MAX_SKILL_ROOTS} skill roots are allowed"));
+    }
+
+    let mut normalized = Vec::new();
+    for root in roots {
+        let value = root.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.len() > MAX_SKILL_ROOT_LENGTH || value.chars().any(char::is_control) {
+            return Err("A skill root is invalid or too long".to_string());
+        }
+        if !normalized
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(value))
+        {
+            normalized.push(value.to_string());
+        }
+    }
+    Ok(normalized)
+}
+
+fn skill_roots_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("skill-roots.json"))
+        .map_err(|error| format!("Could not resolve app configuration directory: {error}"))
+}
+
+#[cfg(debug_assertions)]
+fn development_skill_root() -> Option<String> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../skills")
+        .canonicalize()
+        .ok()
+        .filter(|path| path.is_dir())
+        .map(|path| node_compatible_path(&path).to_string_lossy().into_owned())
+}
+
+#[cfg(not(debug_assertions))]
+fn development_skill_root() -> Option<String> {
+    None
+}
+
+fn read_skill_roots(app: &AppHandle) -> Result<Vec<String>, String> {
+    let path = skill_roots_settings_path(app)?;
+    if !path.exists() {
+        return Ok(development_skill_root().into_iter().collect());
+    }
+    let bytes =
+        fs::read(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    if bytes.len() > 64 * 1024 {
+        return Err("Skill-root settings exceed the size limit".to_string());
+    }
+    let settings: SkillRootsSettings = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Skill-root settings are malformed: {error}"))?;
+    if settings.version != 1 {
+        return Err(format!(
+            "Unsupported skill-root settings version {}",
+            settings.version
+        ));
+    }
+    normalize_skill_roots(settings.roots)
+}
+
+#[tauri::command]
+fn load_skill_roots(app: AppHandle) -> Result<Vec<String>, String> {
+    read_skill_roots(&app)
+}
+
+#[tauri::command]
+fn save_skill_roots(app: AppHandle, roots: Vec<String>) -> Result<Vec<String>, String> {
+    let roots = normalize_skill_roots(roots)?;
+    let path = skill_roots_settings_path(&app)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Skill-root settings path has no parent".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    let payload = serde_json::to_vec_pretty(&SkillRootsSettings {
+        version: 1,
+        roots: roots.clone(),
+    })
+    .map_err(|error| format!("Could not encode skill-root settings: {error}"))?;
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary, payload)
+        .map_err(|error| format!("Could not write {}: {error}", temporary.display()))?;
+    if path.exists() {
+        fs::remove_file(&path)
+            .map_err(|error| format!("Could not replace {}: {error}", path.display()))?;
+    }
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("Could not publish {}: {error}", path.display()))?;
+    Ok(roots)
+}
+
+async fn run_agent_utility(app: &AppHandle, request: Value) -> Result<Value, String> {
+    let utility_script = utility_script_path(app)?;
+    let node_runtime = node_runtime_path(app)?;
+    let runtime_directory = runtime_working_directory(app)?;
+    let mut command = Command::new(node_runtime);
+    command
+        .arg(utility_script)
+        .current_dir(runtime_directory)
+        .env_clear()
+        .envs(utility_environment(&request))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start the agent utility: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Agent utility stdin is unavailable".to_string())?;
+    let encoded = serde_json::to_vec(&request)
+        .map_err(|error| format!("Could not encode utility request: {error}"))?;
+    stdin
+        .write_all(&encoded)
+        .await
+        .map_err(|error| format!("Could not send utility request: {error}"))?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| format!("Could not wait for the agent utility: {error}"))?;
+    if output.stdout.len() > MAX_UTILITY_OUTPUT_BYTES
+        || output.stderr.len() > MAX_UTILITY_OUTPUT_BYTES
+    {
+        return Err("Agent utility output exceeded the size limit".to_string());
+    }
+    if !output.status.success() {
+        let detail = sanitize_diagnostic(String::from_utf8_lossy(&output.stderr));
+        return Err(if detail.trim().is_empty() {
+            format!("Agent utility exited with {}", output.status)
+        } else {
+            format!("Agent utility failed: {}", detail.trim())
+        });
+    }
+    let response: UtilityResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Agent utility returned invalid JSON: {error}"))?;
+    if !response.ok {
+        return Err(sanitize_diagnostic(response.error.unwrap_or_else(|| {
+            "Agent utility failed without details".to_string()
+        })));
+    }
+    response
+        .data
+        .ok_or_else(|| "Agent utility returned no data".to_string())
+}
+
+#[tauri::command]
+async fn scan_skill_catalog(app: AppHandle, roots: Vec<String>) -> Result<Value, String> {
+    let roots = normalize_skill_roots(roots)?;
+    run_agent_utility(
+        &app,
+        json!({
+            "operation": "scan_skill_catalog",
+            "roots": roots,
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn provider_health(app: AppHandle, provider: ProviderConfig) -> Result<Value, String> {
+    run_agent_utility(
+        &app,
+        json!({
+            "operation": "provider_health",
+            "provider": provider,
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn prepare_migrate_to_vite(
+    app: AppHandle,
+    repository: String,
+    skill_id: String,
+    skill_root: String,
+) -> Result<Value, String> {
+    let configured_roots = read_skill_roots(&app)?;
+    if !configured_roots
+        .iter()
+        .any(|root| root.eq_ignore_ascii_case(skill_root.trim()))
+    {
+        return Err("The selected skill root is not configured".to_string());
+    }
+    if skill_id.trim().is_empty() || skill_id.len() > 200 {
+        return Err("The selected skill ID is invalid".to_string());
+    }
+    let preflight_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
+        .join("preflights");
+    fs::create_dir_all(&preflight_root).map_err(|error| {
+        format!(
+            "Could not create preflight storage at {}: {error}",
+            preflight_root.display()
+        )
+    })?;
+    run_agent_utility(
+        &app,
+        json!({
+            "operation": "prepare_migrate_to_vite",
+            "repository": repository,
+            "skillId": skill_id,
+            "skillRoot": skill_root,
+            "configuredRoots": configured_roots,
+            "preflightRoot": node_compatible_path(&preflight_root).to_string_lossy(),
+        }),
+    )
+    .await
+}
+
 fn emit_diagnostic(app: &AppHandle, run_id: &str, level: &str, message: impl Into<String>) {
     let _ = app.emit(
         "agent-event",
@@ -121,9 +492,98 @@ fn emit_diagnostic(app: &AppHandle, run_id: &str, level: &str, message: impl Int
             "type": "diagnostic",
             "runId": run_id,
             "level": level,
-            "message": message.into().chars().take(4_000).collect::<String>()
+            "message": sanitize_diagnostic(message)
         }),
     );
+}
+
+fn emit_host_exit_result(
+    app: &AppHandle,
+    run_id: &str,
+    cancelled: bool,
+    message: impl Into<String>,
+) {
+    let _ = app.emit(
+        "agent-event",
+        json!({
+            "type": "result",
+            "runId": run_id,
+            "success": false,
+            "cancelled": cancelled,
+            "error": sanitize_diagnostic(message)
+        }),
+    );
+}
+
+fn validate_agent_event(event: Value, expected_run_id: &str) -> Result<Value, String> {
+    let object = event
+        .as_object()
+        .ok_or_else(|| "Agent event must be an object".to_string())?;
+    if object.get("runId").and_then(Value::as_str) != Some(expected_run_id) {
+        return Err("Agent event run ID does not match the active run".to_string());
+    }
+    let event_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Agent event type is missing".to_string())?;
+    let require_string = |key: &str, maximum: usize| -> Result<&str, String> {
+        let value = object
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Agent {event_type} event field {key} must be a string"))?;
+        if value.len() > maximum {
+            return Err(format!("Agent {event_type} event field {key} is too long"));
+        }
+        Ok(value)
+    };
+    match event_type {
+        "status" => {
+            require_string("phase", 200)?;
+            require_string("message", 4_000)?;
+            if object
+                .get("details")
+                .is_some_and(|value| !value.is_object())
+            {
+                return Err("Agent status details must be an object".to_string());
+            }
+        }
+        "text_delta" => {
+            require_string("text", 1024 * 1024)?;
+        }
+        "tool_call" => {
+            require_string("name", 200)?;
+            if !object.contains_key("input") {
+                return Err("Agent tool_call event is missing input".to_string());
+            }
+        }
+        "diagnostic" => {
+            require_string("message", 4_000)?;
+            if !matches!(
+                object.get("level").and_then(Value::as_str),
+                Some("info" | "warning" | "error")
+            ) {
+                return Err("Agent diagnostic level is invalid".to_string());
+            }
+        }
+        "result" => {
+            if !object.get("success").is_some_and(Value::is_boolean)
+                || !object.get("cancelled").is_some_and(Value::is_boolean)
+            {
+                return Err("Agent result flags must be booleans".to_string());
+            }
+            if object.get("error").is_some_and(|value| !value.is_string()) {
+                return Err("Agent result error must be a string".to_string());
+            }
+            if let Some(result) = object.get("result")
+                && !result.is_string()
+                && !result.is_object()
+            {
+                return Err("Agent result payload must be text or an object".to_string());
+            }
+        }
+        _ => return Err(format!("Unknown agent event type: {event_type}")),
+    }
+    Ok(event)
 }
 
 async fn clear_active_run(app: &AppHandle, run_id: &str) {
@@ -134,45 +594,34 @@ async fn clear_active_run(app: &AppHandle, run_id: &str) {
     }
 }
 
-#[tauri::command]
-async fn start_agent(
+async fn spawn_agent_host(
     app: AppHandle,
     state: State<'_, AgentProcessState>,
-    request: AgentStartRequest,
+    run_id: String,
+    start_message: Value,
 ) -> Result<AgentStartResponse, String> {
-    if request.cwd.trim().is_empty() || request.prompt.trim().is_empty() {
-        return Err("Repository path and prompt are required".to_string());
-    }
-    if !(1..=20).contains(&request.max_turns) {
-        return Err("maxTurns must be between 1 and 20".to_string());
-    }
-
     let mut active_guard = state.active.lock().await;
     if let Some(active) = active_guard.as_ref() {
         return Err(format!("Run {} is already active", active.run_id));
     }
 
-    let host_script = host_script_path()?;
-    let run_id = Uuid::new_v4().to_string();
-    let start_message = json!({
-        "type": "start",
-        "runId": run_id,
-        "cwd": request.cwd,
-        "prompt": request.prompt,
-        "maxTurns": request.max_turns,
-        "provider": request.provider,
-    });
-
-    let mut command = Command::new("node");
+    let host_script = host_script_path(&app)?;
+    let node_runtime = node_runtime_path(&app)?;
+    let claude_runtime = claude_runtime_path(&app)?;
+    let runtime_directory = runtime_working_directory(&app)?;
+    let mut command = Command::new(node_runtime);
     command
         .arg(host_script)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(runtime_directory)
         .env_clear()
         .envs(minimal_environment())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(path) = claude_runtime {
+        command.env("PIMP_CLAUDE_CODE_PATH", path);
+    }
 
     let mut child = command
         .spawn()
@@ -202,7 +651,9 @@ async fn start_agent(
         .await
         .map_err(|error| format!("Could not flush start command: {error}"))?;
 
+    let cancellation_requested = Arc::new(AtomicBool::new(false));
     *active_guard = Some(ActiveAgent {
+        cancellation_requested: cancellation_requested.clone(),
         run_id: run_id.clone(),
         stdin: Arc::new(Mutex::new(child_stdin)),
         pid,
@@ -211,19 +662,33 @@ async fn start_agent(
 
     let stdout_app = app.clone();
     let stdout_run_id = run_id.clone();
-    tauri::async_runtime::spawn(async move {
+    let terminal_result_seen = Arc::new(AtomicBool::new(false));
+    let stdout_terminal_result_seen = terminal_result_seen.clone();
+    let stdout_task = tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
+                Ok(Some(line)) if line.len() > MAX_AGENT_EVENT_BYTES => emit_diagnostic(
+                    &stdout_app,
+                    &stdout_run_id,
+                    "error",
+                    "Rejected oversized agent event",
+                ),
+                Ok(Some(line)) => match serde_json::from_str::<Value>(&line)
+                    .map_err(|error| error.to_string())
+                    .and_then(|event| validate_agent_event(event, &stdout_run_id))
+                {
                     Ok(event) => {
+                        if event.get("type").and_then(Value::as_str) == Some("result") {
+                            stdout_terminal_result_seen.store(true, Ordering::Release);
+                        }
                         let _ = stdout_app.emit("agent-event", event);
                     }
                     Err(error) => emit_diagnostic(
                         &stdout_app,
                         &stdout_run_id,
                         "warning",
-                        format!("Agent emitted invalid JSON: {error}"),
+                        format!("Rejected agent event: {error}"),
                     ),
                 },
                 Ok(None) => break,
@@ -254,25 +719,103 @@ async fn start_agent(
     let wait_app = app.clone();
     let wait_run_id = run_id.clone();
     tauri::async_runtime::spawn(async move {
-        match child.wait().await {
-            Ok(status) if !status.success() => emit_diagnostic(
+        let exit = child.wait().await;
+        let _ = stdout_task.await;
+        if !terminal_result_seen.load(Ordering::Acquire) {
+            let detail = match exit {
+                Ok(status) => format!("Agent host exited with {status} before a terminal result"),
+                Err(error) => format!("Could not wait for agent host: {error}"),
+            };
+            emit_host_exit_result(
                 &wait_app,
                 &wait_run_id,
-                "error",
-                format!("Agent host exited with {status}"),
-            ),
-            Err(error) => emit_diagnostic(
-                &wait_app,
-                &wait_run_id,
-                "error",
-                format!("Could not wait for agent host: {error}"),
-            ),
-            _ => {}
+                cancellation_requested.load(Ordering::Acquire),
+                detail,
+            );
         }
         clear_active_run(&wait_app, &wait_run_id).await;
     });
 
     Ok(AgentStartResponse { run_id })
+}
+
+#[tauri::command]
+async fn start_agent(
+    app: AppHandle,
+    state: State<'_, AgentProcessState>,
+    request: AgentStartRequest,
+) -> Result<AgentStartResponse, String> {
+    if request.cwd.trim().is_empty() || request.prompt.trim().is_empty() {
+        return Err("Repository path and prompt are required".to_string());
+    }
+    if !(1..=20).contains(&request.max_turns) {
+        return Err("maxTurns must be between 1 and 20".to_string());
+    }
+
+    let run_id = Uuid::new_v4().to_string();
+    let start_message = json!({
+        "type": "start",
+        "runId": run_id,
+        "cwd": request.cwd,
+        "prompt": request.prompt,
+        "maxTurns": request.max_turns,
+        "provider": request.provider,
+    });
+
+    spawn_agent_host(app, state, run_id, start_message).await
+}
+
+#[tauri::command]
+async fn start_plan(
+    app: AppHandle,
+    state: State<'_, AgentProcessState>,
+    request: PlanStartRequest,
+) -> Result<AgentStartResponse, String> {
+    let parsed_preflight_id = Uuid::parse_str(request.preflight_id.trim())
+        .map_err(|_| "preflightId must be a UUID".to_string())?;
+    if parsed_preflight_id.to_string() != request.preflight_id.trim().to_lowercase() {
+        return Err("preflightId must use canonical UUID form".to_string());
+    }
+    if !(1..=20).contains(&request.max_turns) {
+        return Err("maxTurns must be between 1 and 20".to_string());
+    }
+    let model = match &request.provider {
+        ProviderConfig::Claude { model } | ProviderConfig::Local { model, .. } => model,
+    };
+    if model.trim().is_empty() || model.len() > 200 || model.chars().any(char::is_control) {
+        return Err("A valid provider model is required".to_string());
+    }
+    if matches!(&request.provider, ProviderConfig::Claude { .. }) && !request.remote_egress_approved
+    {
+        return Err("Explicit remote-egress approval is required for Claude".to_string());
+    }
+
+    let preflight_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not resolve app data directory: {error}"))?
+        .join("preflights")
+        .canonicalize()
+        .map_err(|error| format!("Preflight storage is unavailable: {error}"))?;
+    let preflight_path = preflight_root
+        .join(parsed_preflight_id.to_string())
+        .join("preflight.json")
+        .canonicalize()
+        .map_err(|error| format!("Prepared context is unavailable: {error}"))?;
+    if !preflight_path.starts_with(&preflight_root) || !preflight_path.is_file() {
+        return Err("Prepared context path is invalid".to_string());
+    }
+
+    let run_id = Uuid::new_v4().to_string();
+    let start_message = json!({
+        "type": "start_plan",
+        "runId": run_id,
+        "preflightPath": node_compatible_path(&preflight_path).to_string_lossy(),
+        "maxTurns": request.max_turns,
+        "provider": request.provider,
+        "remoteEgressApproved": request.remote_egress_approved,
+    });
+    spawn_agent_host(app, state, run_id, start_message).await
 }
 
 #[cfg(target_os = "windows")]
@@ -309,6 +852,8 @@ async fn cancel_agent(
             .cloned()
     }
     .ok_or_else(|| "The requested run is not active".to_string())?;
+
+    active.cancellation_requested.store(true, Ordering::Release);
 
     {
         let mut stdin = active.stdin.lock().await;
@@ -353,7 +898,13 @@ pub fn run() {
         .manage(AgentProcessState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            load_skill_roots,
+            save_skill_roots,
+            scan_skill_catalog,
+            prepare_migrate_to_vite,
+            provider_health,
             start_agent,
+            start_plan,
             cancel_agent,
             agent_status
         ])

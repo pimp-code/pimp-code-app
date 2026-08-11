@@ -1,6 +1,6 @@
 # Pimp Code App — Product and Implementation Plan
 
-Status: implementation in progress, updated 11 August 2026
+Status: Phase 1 plan-only slice implemented; live-provider and second-machine gates remain, updated 11 August 2026
 
 ## Recommended product direction
 
@@ -516,7 +516,7 @@ Deliverables:
 - npm monorepo, Tauri 2 shell, React/Vite renderer, typed commands/events, packaged engine sidecar;
 - exact repository/workspace picker and safe metadata scan;
 - recursive Agent Skill discovery, validation, hashing, catalog UI;
-- app-owned immutable run storage and timeline;
+- app-owned immutable plan/run artifacts and an in-session normalized timeline;
 - Claude Code as the first Claude runtime adapter plus the explicitly labelled loopback compatibility bridge for the first local-model path;
 - provider/runtime health checks, available model discovery where supported, and configurable bounded turn limits;
 - context/egress preview and a clearly labelled `migrate-to-vite` plan-only workflow with structured Markdown and JSON output;
@@ -710,8 +710,8 @@ If the goal is to reach a trustworthy beta quickly, use these defaults:
 
 ## Immediate implementation sequence
 
-1. Commit the verified Tauri feasibility spike and this architecture update.
-2. Replace workspace/system runtime lookup with reproducibly prepared Tauri sidecars and pass the two-machine smoke gate.
-3. Implement the recursive `../skills/**/SKILL.md` catalog, including malformed/orphaned metadata visibility, package digests, and configurable roots.
-4. Build the `migrate-to-vite` read-only vertical slice: canonical repository confirmation, applicability and file-context preview, explicit Claude egress approval, structured plan output, and app-owned Markdown/JSON artifacts.
-5. Add durable state-machine history before enabling any target write or project command.
+1. **Complete:** commit the verified Tauri feasibility spike and this architecture update.
+2. **Implementation complete; release gate pending:** replace workspace/system runtime lookup with checksum-pinned packaged Node, agent-host, and Claude Code resources. The NSIS installer builds locally; a clean second-Windows-machine install plus live Claude and local-model runs still gate portability.
+3. **Complete:** implement the recursive `../skills/**/SKILL.md` catalog, including malformed/orphaned metadata visibility, package digests, inert scripts, path/link rejection, and configurable roots.
+4. **Implementation complete; live smoke pending:** build the `migrate-to-vite` read-only slice with canonical repository confirmation, applicability and exact context preview, explicit Claude egress approval, zero model tools, structured plan validation, and app-owned Markdown/JSON artifacts.
+5. **Next:** add durable state-machine history before enabling any target write or project command.

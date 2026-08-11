@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Pimp Code Agent Spike",
+  "productName": "Pimp Code",
   "version": "0.0.0",
-  "identifier": "dev.pimpcode.agent-spike",
+  "identifier": "dev.pimpcode.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -15,7 +15,7 @@
     },
     "windows": [
       {
-        "title": "Pimp Code — Agent Runtime Spike",
+        "title": "Pimp Code - Plan-only migration",
         "width": 1180,
         "height": 780,
         "minWidth": 900,
@@ -25,6 +25,10 @@
     ]
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["nsis"],
+    "resources": {
+      "resources/runtime/": "runtime/"
+    }
   }
 }

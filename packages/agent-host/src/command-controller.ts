@@ -1,6 +1,7 @@
 import { startAgentRun, type ActiveRun } from "./agent-runner.js";
-import type { HostEvent, StartCommand } from "./protocol.js";
-import { parseHostCommand, validateStartCommand } from "./validation.js";
+import { startPlanRun } from "./plan-runner.js";
+import type { HostEvent, RunCommand } from "./protocol.js";
+import { parseHostCommand, validateRunCommand } from "./validation.js";
 
 interface PendingRun {
   activeRun?: ActiveRun;
@@ -11,20 +12,29 @@ interface PendingRun {
 }
 
 interface CommandControllerDependencies {
-  start?: typeof startAgentRun;
-  validate?: typeof validateStartCommand;
+  start?: (command: RunCommand, emit: (event: HostEvent) => void) => ActiveRun;
+  validate?: (value: unknown) => Promise<RunCommand>;
 }
 
 type ValidationOutcome =
   | { type: "cancelled" }
   | { type: "failed"; error: unknown }
-  | { type: "validated"; command: StartCommand };
+  | { type: "validated"; command: RunCommand };
+
+function startRun(
+  command: RunCommand,
+  emit: (event: HostEvent) => void,
+): ActiveRun {
+  return command.type === "start_plan"
+    ? startPlanRun(command, emit)
+    : startAgentRun(command, emit);
+}
 
 export class HostCommandController {
   readonly #emit: (event: HostEvent) => void;
   readonly #onFinished: () => void;
-  readonly #start: typeof startAgentRun;
-  readonly #validate: typeof validateStartCommand;
+  readonly #start: (command: RunCommand, emit: (event: HostEvent) => void) => ActiveRun;
+  readonly #validate: (value: unknown) => Promise<RunCommand>;
   #pendingRun?: PendingRun;
 
   constructor(
@@ -34,8 +44,8 @@ export class HostCommandController {
   ) {
     this.#emit = emit;
     this.#onFinished = onFinished;
-    this.#start = dependencies.start ?? startAgentRun;
-    this.#validate = dependencies.validate ?? validateStartCommand;
+    this.#start = dependencies.start ?? startRun;
+    this.#validate = dependencies.validate ?? validateRunCommand;
   }
 
   handleLine(line: string): void {
@@ -95,7 +105,7 @@ export class HostCommandController {
     pendingRun.activeRun?.abort();
   }
 
-  async #run(command: StartCommand, pendingRun: PendingRun): Promise<void> {
+  async #run(command: RunCommand, pendingRun: PendingRun): Promise<void> {
     try {
       const validation = this.#validate(command).then<
         ValidationOutcome,

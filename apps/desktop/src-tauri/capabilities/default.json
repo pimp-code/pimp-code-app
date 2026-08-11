@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Minimal permissions for the Tauri feasibility spike",
+  "description": "Minimal permissions for the plan-only desktop slice",
   "windows": ["main"],
   "permissions": [
     "core:event:allow-listen",

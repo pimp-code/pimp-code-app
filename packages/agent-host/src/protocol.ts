@@ -17,12 +17,56 @@ export interface StartCommand {
   provider: ProviderConfig;
 }
 
+export interface StartPlanCommand {
+  type: "start_plan";
+  runId: string;
+  preflightPath: string;
+  maxTurns: number;
+  provider: ProviderConfig;
+  remoteEgressApproved: boolean;
+}
+
 export interface CancelCommand {
   type: "cancel";
   runId: string;
 }
 
-export type HostCommand = StartCommand | CancelCommand;
+export type RunCommand = StartCommand | StartPlanCommand;
+
+export type HostCommand = RunCommand | CancelCommand;
+
+export interface RunArtifactPaths {
+  runDirectory?: string;
+  markdown?: string;
+  json?: string;
+  context?: string;
+  preflight?: string;
+  metadata?: string;
+}
+
+export interface RunUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  costUsd?: number;
+}
+
+export interface RunResultMetadata {
+  provider?: string;
+  model?: string;
+  skillDigest?: string;
+  contextHash?: string;
+  filesInspected?: string[];
+  artifacts?: RunArtifactPaths;
+  usage?: RunUsage;
+}
+
+export interface StructuredRunResult {
+  markdown?: string;
+  json?: unknown;
+  metadata?: RunResultMetadata;
+  artifacts?: RunArtifactPaths;
+}
 
 export type HostEvent =
   | {
@@ -54,11 +98,13 @@ export type HostEvent =
       runId: string;
       success: boolean;
       cancelled: boolean;
-      result?: string;
+      result?: string | StructuredRunResult;
       error?: string;
       sessionId?: string;
       durationMs?: number;
       turns?: number;
       costUsd?: number;
       usage?: unknown;
+      metadata?: RunResultMetadata;
+      artifacts?: RunArtifactPaths;
     };

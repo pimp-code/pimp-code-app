@@ -1,6 +1,6 @@
-# Tauri + Claude Code runtime spike
+# Tauri plan-only vertical slice
 
-This spike validates a local Tauri shell driving the official Claude Agent SDK through a separate TypeScript process.
+This slice validates a local Tauri shell driving a packaged TypeScript engine and the official Claude Agent SDK through a supervised child process.
 
 ## What works
 
@@ -10,20 +10,25 @@ This spike validates a local Tauri shell driving the official Claude Agent SDK t
 - Claude API profile using `ANTHROPIC_API_KEY` from the host environment.
 - Local compatibility profile using the same Claude Code binary through an in-process Anthropic Messages to OpenAI Chat Completions bridge. This is a transitional runtime adapter, not the universal backend or native LM Studio/Ollama support.
 - Loopback-only local endpoints.
-- Read-only `plan` mode with only `Read`, `Glob`, and `Grep` exposed.
+- Recursive `**/SKILL.md` catalog discovery with strict frontmatter/YAML validation, duplicate detection, package digests, inert scripts, orphan diagnostics, and configurable roots.
+- A dedicated `migrate-to-vite` plan-only workflow that snapshots an exact, bounded context manifest, redacts environment assignments, rejects secret paths, and revalidates repository and skill hashes immediately before a run.
+- Zero model tools in the plan-only workflow. The model receives only the approved immutable snapshot and its output must pass a strict structured-plan schema.
+- Explicit Claude context-egress approval, provider health/model discovery, and configurable 1-20 turn limits.
+- App-owned immutable Markdown, JSON, context, preflight, and run-metadata artifacts outside the selected repository.
 - User cancellation through `AbortController`, with a five-second Windows process-tree kill fallback.
 - Non-essential Claude Code telemetry, error reporting, feedback, auto-memory, project settings, and marketplace auto-install disabled for the run.
+- A Windows NSIS release containing checksum-pinned Node 24, agent-host bundles, and Claude Code, so the installed app does not resolve system Node or development-workspace files.
 
 ## Intentional limitations
 
-- This is a feasibility spike, not the secure repository executor described in `PROJECT_PLAN.md`.
-- Claude Code's built-in `Read`, `Glob`, and `Grep` tools are read-only but are not yet constrained to an immutable approved file manifest. Use only non-sensitive fixtures until the engine-owned context snapshot replaces direct repository tools.
+- This is a plan-only vertical slice, not the controlled Apply executor described in `PROJECT_PLAN.md`.
+- The older low-level `start_agent` spike protocol still exists for regression coverage. The product UI uses `start_plan`, whose engine-owned snapshot and zero-tool policy are the supported boundary.
 - The bridge implements the protocol subset needed by the current test. It does not promise parity with Claude features such as thinking blocks, prompt caching, image blocks, or every tool-streaming edge case.
 - A local model must support the OpenAI Chat Completions API and should support tool calling. A successful connection does not prove that the model can follow long skills safely.
 - Only loopback endpoints (`localhost`, `127.0.0.1`, or `::1`) are accepted.
-- The current release executable is not self-contained. It still launches system Node and the built agent-host JavaScript from this workspace. Packaging Node/the host/Claude binary as Tauri sidecars is the next spike gate.
 - The Claude API path has not been live-tested without a user-provided API key.
 - No real local model was available at `127.0.0.1:1234` during implementation. The full local path is covered with a controlled fake OpenAI-compatible server and the real bundled Claude Code binary.
+- A second Windows-machine install and live Claude/local-model smoke remain release gates; producing an installer on the development machine is not proof of portability.
 
 ## Run the desktop spike
 
@@ -51,7 +56,7 @@ $env:ANTHROPIC_API_KEY = "your-api-key"
 npm.cmd run dev
 ```
 
-Select **Claude API**, use a Claude Code model alias such as `sonnet`, choose a repository, and start a plan-only run. Do not put the API key into the UI or a repository file.
+Select **Claude**, run the health check, use a model alias such as `sonnet`, choose a repository and the `migrate-to-vite` skill, approve the exact context, and start the plan. Do not put the API key into the UI or a repository file.
 
 ### LM Studio or another local OpenAI-compatible server
 
@@ -80,8 +85,8 @@ The tests include a real Claude Agent SDK/Claude Code binary invocation against 
 Before treating Tauri as the product shell:
 
 1. Run one live Claude API plan against a non-sensitive fixture repository.
-2. Run one live LM Studio or Ollama plan with a tool-capable local model.
+2. Run one live LM Studio or Ollama plan with a structured-output-capable local model.
 3. Verify cancellation while each model is generating.
-4. Package the agent host and platform Claude Code binary so the installed app needs neither system Node nor workspace files.
+4. Install the NSIS package on a clean second Windows machine without system Node or the development workspace.
 5. Observe outbound traffic and confirm the promised local-only mode.
-6. Keep `PROJECT_PLAN.md` aligned with the selected Tauri architecture while recording any unmet release gates explicitly.
+6. Add durable run history before any Apply workflow.

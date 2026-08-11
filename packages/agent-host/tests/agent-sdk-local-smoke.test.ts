@@ -66,7 +66,11 @@ test(
         JSON.stringify(events, null, 2),
       );
       assert.equal(result.success, true, JSON.stringify(events, null, 2));
-      assert.match(result.result ?? "", /local runtime is connected/i);
+      assert.equal(typeof result.result, "string", JSON.stringify(events, null, 2));
+      assert.match(
+        typeof result.result === "string" ? result.result : "",
+        /local runtime is connected/i,
+      );
       assert.ok(requests > 0, "Claude Code did not call the local endpoint");
     } finally {
       await new Promise<void>((resolve, reject) =>

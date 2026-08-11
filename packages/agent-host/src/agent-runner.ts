@@ -3,6 +3,8 @@ import {
   type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import type { HostEvent, StartCommand } from "./protocol.js";
 import { startLocalAnthropicBridge, type LocalBridge } from "./local-anthropic-bridge.js";
 
@@ -26,7 +28,16 @@ export interface ActiveRun {
   done: Promise<void>;
 }
 
-function buildBaseEnvironment(): Record<string, string | undefined> {
+export function configuredClaudeExecutable(): string | undefined {
+  const executable = process.env.PIMP_CLAUDE_CODE_PATH;
+  if (!executable) return undefined;
+  if (!isAbsolute(executable) || !statSync(executable).isFile()) {
+    throw new Error("The packaged Claude Code executable path is invalid");
+  }
+  return executable;
+}
+
+export function buildBaseEnvironment(): Record<string, string | undefined> {
   const environment: Record<string, string | undefined> = {};
   for (const key of SAFE_ENV_KEYS) {
     if (process.env[key]) environment[key] = process.env[key];
@@ -47,7 +58,7 @@ function buildBaseEnvironment(): Record<string, string | undefined> {
   };
 }
 
-function redactDiagnostic(value: string): string {
+export function redactDiagnostic(value: string): string {
   let redacted = value;
   for (const secret of [
     process.env.ANTHROPIC_API_KEY,
@@ -64,7 +75,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function normalizeSdkMessage(runId: string, message: SDKMessage): HostEvent[] {
+export function normalizeSdkMessage(runId: string, message: SDKMessage): HostEvent[] {
   if (message.type === "stream_event") {
     const event = asRecord(message.event);
     const delta = asRecord(event?.delta);
@@ -209,6 +220,7 @@ export function startAgentRun(
             : `Starting Claude Code with ${command.provider.model}`,
       });
 
+      const claudeExecutable = configuredClaudeExecutable();
       const agentQuery = query({
         prompt: command.prompt,
         options: {
@@ -219,6 +231,9 @@ export function startAgentRun(
           includePartialMessages: true,
           maxTurns: command.maxTurns,
           model: command.provider.model,
+          ...(claudeExecutable
+            ? { pathToClaudeCodeExecutable: claudeExecutable }
+            : {}),
           permissionMode: "plan",
           settingSources: [],
           strictMcpConfig: true,
