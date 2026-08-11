@@ -517,6 +517,140 @@ export function validateUpgradeReactRouterToV8PlanV1(
   return plan;
 }
 
+const ROUTE_DEFINITION_SIGNAL =
+  /(?:<Route\b|\bcreate(?:Browser|Hash|Memory)Router\s*\(|\buseRoutes\s*\()/u;
+
+function trustedInventoryPaths(
+  preflight: UpgradeReactRouterToV8Preflight,
+  reasons: ReadonlySet<string>,
+): string[] {
+  return preflight.context.manifest.files
+    .filter((file) => reasons.has(file.reason))
+    .map((file) => file.relativePath);
+}
+
+function normalizeProviderRouteParity(
+  value: unknown,
+  preflight: UpgradeReactRouterToV8Preflight,
+): unknown[] {
+  const routeDocuments = preflight.context.documents.filter(
+    (document) =>
+      document.reason === "router-source" ||
+      (document.reason === "source-entry" && ROUTE_DEFINITION_SIGNAL.test(document.content)),
+  );
+  const routePaths = new Set(routeDocuments.map((document) => document.relativePath));
+  const normalized = (Array.isArray(value) ? value : []).flatMap((candidate) => {
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+      return [];
+    }
+    const entry = candidate as Record<string, unknown>;
+    const evidence = (Array.isArray(entry.evidence) ? entry.evidence : []).filter(
+      (item) => {
+        if (typeof item !== "object" || item === null || Array.isArray(item)) return false;
+        const relativePath = (item as Record<string, unknown>).relativePath;
+        return typeof relativePath === "string" && routePaths.has(relativePath);
+      },
+    );
+    return evidence.length > 0 ? [{ ...entry, evidence }] : [];
+  });
+  if (normalized.length > 0 || routeDocuments.length === 0) return normalized;
+
+  const document = routeDocuments[0]!;
+  return [{
+    routePattern: `Route definitions in ${document.relativePath}`,
+    currentBehavior: "The approved context contains route definitions that must retain their current matching and navigation behavior.",
+    proposedV8Behavior: "Preserve those route destinations and navigation outcomes while adapting the implementation to React Router v8.",
+    evidence: [{
+      relativePath: document.relativePath,
+      fact: "The approved context contains route definitions in this file.",
+    }],
+    risks: ["Dynamic matching, redirects, and navigation state require verification after migration."],
+  }];
+}
+
+function normalizeProviderVerification(value: unknown): unknown[] {
+  const blocked = new Set([
+    "bash",
+    "cmd",
+    "cmd.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "sh",
+    "zsh",
+  ]);
+  return (Array.isArray(value) ? value : []).flatMap((candidate) => {
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+      return [];
+    }
+    const entry = candidate as Record<string, unknown>;
+    const executable = typeof entry.executable === "string"
+      ? entry.executable.trim()
+      : "";
+    if (
+      !executable ||
+      executable.length > 200 ||
+      blocked.has(executable.toLowerCase()) ||
+      /[;&|<>`\r\n]/u.test(executable)
+    ) {
+      return [];
+    }
+    return [{ ...entry, executable, requiresApproval: true }];
+  });
+}
+
+export function validateUpgradeReactRouterToV8ProviderPlanV1(
+  value: unknown,
+  preflight: UpgradeReactRouterToV8Preflight,
+): UpgradeReactRouterToV8PlanV1 {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return validateUpgradeReactRouterToV8PlanV1(value, preflight);
+  }
+  const providerPlan = value as Record<string, unknown>;
+  const providerInventory =
+    typeof providerPlan.inventory === "object" &&
+    providerPlan.inventory !== null &&
+    !Array.isArray(providerPlan.inventory)
+      ? (providerPlan.inventory as Record<string, unknown>)
+      : {};
+  const trustedApplicability: ReactRouterApplicability = {
+    status: preflight.applicability.status,
+    rationale: preflight.applicability.rationale,
+    versions: preflight.applicability.versions.map((entry) => ({ ...entry })),
+    legacyApis: [...preflight.applicability.legacyApis],
+    evidence: preflight.applicability.evidence.map((entry) => ({ ...entry })),
+  };
+  return validateUpgradeReactRouterToV8PlanV1(
+    {
+      ...providerPlan,
+      applicability: trustedApplicability,
+      inventory: {
+        ...providerInventory,
+        currentVersions: trustedApplicability.versions.map((entry) => ({ ...entry })),
+        legacyApis: [...trustedApplicability.legacyApis],
+        routerFiles: trustedInventoryPaths(
+          preflight,
+          new Set(["router-source"]),
+        ),
+        testFiles: trustedInventoryPaths(
+          preflight,
+          new Set(["test-source"]),
+        ),
+        deploymentFiles: trustedInventoryPaths(
+          preflight,
+          new Set(["ci-workflow", "deployment-config"]),
+        ),
+      },
+      routeParity: normalizeProviderRouteParity(providerPlan.routeParity, preflight),
+      verification: normalizeProviderVerification(providerPlan.verification),
+      filesInspected: preflight.context.manifest.files
+        .map((file) => file.relativePath)
+        .sort(),
+    },
+    preflight,
+  );
+}
+
 export function parseUpgradeReactRouterToV8PlanV1(
   text: string,
   preflight: UpgradeReactRouterToV8Preflight,

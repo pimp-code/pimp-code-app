@@ -9,13 +9,28 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  AppShell,
+  JobsPage,
+  ProjectsPage,
+  ProviderProfilesPage,
+  SkillsPage,
+  type AppView,
+} from "./AppShell";
+import {
   type AgentEvent,
   type CatalogIssue,
   type DetailNote,
+  type JobProviderSnapshot,
+  type JobRecord,
+  type JobStore,
   type PlanPreflight,
+  type ProjectSettings,
   type ProviderConfig,
   type ProviderHealth,
   type ProviderKind,
+  type ProviderProfileInput,
+  type ProviderProfileRecord,
+  type ProviderProfileSettings,
   type RunArtifactPaths,
   type RunResultMetadata,
   type SkillCatalog,
@@ -25,7 +40,10 @@ import {
   errorMessage,
   formatBytes,
   normalizePreflight,
+  normalizeJobStore,
+  normalizeProjectSettings,
   normalizeProviderHealth,
+  normalizeProviderProfileSettings,
   normalizeSkillCatalog,
   shortDigest,
 } from "./contracts";
@@ -144,7 +162,57 @@ function catalogEntryName(entry: SkillCatalogEntry): string {
   );
 }
 
+function normalizeJobRecord(value: unknown): JobRecord {
+  const job = normalizeJobStore({ version: 1, jobs: [value] }).jobs[0];
+  if (!job) throw new Error("The desktop host returned an invalid job record.");
+  return job;
+}
+
+function storedJobResultText(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const event = value as { result?: string | StructuredRunResult };
+  return resultText(event.result);
+}
+
+function matchesEditableJob(job: JobRecord): boolean {
+  return job.status === "draft" || job.status === "ready";
+}
+
+function jobSetupMatches(
+  job: JobRecord,
+  provider: JobProviderSnapshot,
+  maxTurns: number,
+): boolean {
+  const savedProvider = job.provider;
+  return (
+    savedProvider !== undefined &&
+    savedProvider.profileId === provider.profileId &&
+    savedProvider.profileRevision === provider.profileRevision &&
+    savedProvider.profileName === provider.profileName &&
+    savedProvider.kind === provider.kind &&
+    (savedProvider.endpoint ?? "") === (provider.endpoint ?? "") &&
+    savedProvider.model === provider.model &&
+    job.runMode === "plan" &&
+    job.approvalMode === "guided" &&
+    job.maxTurns === maxTurns
+  );
+}
+
 export function App() {
+  const [view, setView] = useState<AppView>("skills");
+  const [projects, setProjects] = useState<ProjectSettings>({
+    version: 1,
+    projects: [],
+  });
+  const [providerProfiles, setProviderProfiles] =
+    useState<ProviderProfileSettings>({ version: 1, profiles: [] });
+  const [selectedProviderProfileId, setSelectedProviderProfileId] =
+    useState("");
+  const [jobs, setJobs] = useState<JobStore>({ version: 1, jobs: [] });
+  const [activeJobId, setActiveJobId] = useState("");
+  const [selectedHistoryJobId, setSelectedHistoryJobId] = useState("");
+  const [historyResult, setHistoryResult] = useState("");
+  const [loadingHistoryResult, setLoadingHistoryResult] = useState(false);
   const [repository, setRepository] = useState("");
   const [skillRoots, setSkillRoots] = useState<string[]>([]);
   const [catalog, setCatalog] = useState<SkillCatalog>();
@@ -167,6 +235,9 @@ export function App() {
   const [scanningCatalog, setScanningCatalog] = useState(false);
   const [checkingProvider, setCheckingProvider] = useState(false);
   const [preparing, setPreparing] = useState(false);
+  const [loadingSettings, setLoadingSettings] = useState(true);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [creatingJob, setCreatingJob] = useState(false);
   const sequence = useRef(0);
   const preflightRevision = useRef(0);
   const providerHealthRevision = useRef(0);
@@ -174,6 +245,27 @@ export function App() {
   const selectedSkill = useMemo(
     () => catalog?.entries.find((entry) => entry.id === selectedSkillId),
     [catalog, selectedSkillId],
+  );
+
+  const activeProject = useMemo(
+    () =>
+      projects.projects.find(
+        (project) => project.id === projects.activeProjectId,
+      ),
+    [projects],
+  );
+
+  const selectedProviderProfile = useMemo(
+    () =>
+      providerProfiles.profiles.find(
+        (profile) => profile.id === selectedProviderProfileId,
+      ),
+    [providerProfiles, selectedProviderProfileId],
+  );
+
+  const activeJob = useMemo(
+    () => jobs.jobs.find((job) => job.id === activeJobId),
+    [activeJobId, jobs],
   );
 
   const catalogProblemCount = useMemo(
@@ -210,8 +302,12 @@ export function App() {
     selectedLocalModelIsAvailable;
   const canCheckProvider =
     !checkingProvider &&
+    selectedProviderProfile !== undefined &&
     (providerKind === "claude" || endpoint.trim().length > 0);
   const canPrepare =
+    activeProject !== undefined &&
+    activeJob !== undefined &&
+    selectedProviderProfile !== undefined &&
     repository.trim().length > 0 &&
     selectedSkill !== undefined &&
     isRunnableSkill(selectedSkill) &&
@@ -220,10 +316,14 @@ export function App() {
     !loadingRoots &&
     !scanningCatalog &&
     !preparing &&
+    !loadingSettings &&
     !running;
   const canStart =
+    activeJob !== undefined &&
+    activeJob.status === "ready" &&
     preflight !== undefined &&
     preflight.id.length > 0 &&
+    activeJob.preflightId === preflight.id &&
     preflightApplicable &&
     preflight.contextManifest.files.length > 0 &&
     canonicalConfirmed &&
@@ -257,6 +357,47 @@ export function App() {
     providerHealthRevision.current += 1;
     setProviderHealth(undefined);
   }, []);
+
+  const applyJobRecord = useCallback((job: JobRecord) => {
+    setJobs((current) => ({
+      ...current,
+      jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)].sort(
+        (left, right) => right.updatedAt - left.updatedAt,
+      ),
+    }));
+  }, []);
+
+  const refreshJobs = useCallback(async () => {
+    const value = await invoke<unknown>("list_jobs");
+    setJobs(normalizeJobStore(value));
+  }, []);
+
+  const providerSnapshot = useCallback(
+    (profile = selectedProviderProfile, selectedModel = model): JobProviderSnapshot | undefined =>
+      profile
+        ? {
+            profileId: profile.id,
+            profileRevision: profile.revision,
+            profileName: profile.name,
+            kind: profile.kind,
+            endpoint: profile.endpoint,
+            model: selectedModel.trim() || profile.defaultModel,
+          }
+        : undefined,
+    [model, selectedProviderProfile],
+  );
+
+  const activateProviderProfile = useCallback(
+    (profile: ProviderProfileRecord | undefined) => {
+      setSelectedProviderProfileId(profile?.id ?? "");
+      setProviderKind(profile?.kind ?? "local");
+      setEndpoint(profile?.endpoint ?? DEFAULT_ENDPOINT);
+      setModel(profile?.defaultModel ?? "");
+      invalidateProviderHealth();
+      invalidatePreflight();
+    },
+    [invalidatePreflight, invalidateProviderHealth],
+  );
 
   const applyCatalog = useCallback((nextCatalog: SkillCatalog) => {
     setCatalog(nextCatalog);
@@ -299,6 +440,52 @@ export function App() {
     },
     [applyCatalog, invalidatePreflight],
   );
+
+  useEffect(() => {
+    let disposed = false;
+    setLoadingSettings(true);
+
+    void Promise.all([
+      invoke<unknown>("list_projects"),
+      invoke<unknown>("list_provider_profiles"),
+      invoke<unknown>("list_jobs"),
+    ])
+      .then(([rawProjects, rawProfiles, rawJobs]) => {
+        if (disposed) return;
+        const nextProjects = normalizeProjectSettings(rawProjects);
+        const nextProfiles = normalizeProviderProfileSettings(rawProfiles);
+        const nextJobs = normalizeJobStore(rawJobs);
+        const nextActiveProject = nextProjects.projects.find(
+          (project) => project.id === nextProjects.activeProjectId,
+        );
+        const preferredProfile =
+          nextProfiles.profiles.find(
+            (profile) =>
+              profile.id === nextActiveProject?.defaultProviderProfileId,
+          ) ?? nextProfiles.profiles[0];
+        setProjects(nextProjects);
+        setProviderProfiles(nextProfiles);
+        setJobs(nextJobs);
+        setRepository(
+          nextActiveProject?.workspacePath ?? nextActiveProject?.canonicalPath ?? "",
+        );
+        activateProviderProfile(preferredProfile);
+        if (!nextActiveProject) setView("projects");
+        else setView("skills");
+      })
+      .catch((error: unknown) => {
+        if (!disposed) {
+          setNotice({ tone: "error", message: errorMessage(error) });
+        }
+      })
+      .finally(() => {
+        if (!disposed) setLoadingSettings(false);
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [activateProviderProfile]);
 
   useEffect(() => {
     let disposed = false;
@@ -405,6 +592,13 @@ export function App() {
                 .filter(Boolean)
                 .join(" · "),
           );
+          void refreshJobs().catch((error: unknown) => {
+            addTimeline(
+              "Could not refresh durable job history",
+              "warning",
+              errorMessage(error),
+            );
+          });
           break;
         }
       }
@@ -431,23 +625,307 @@ export function App() {
       disposed = true;
       stopListening?.();
     };
-  }, [addTimeline]);
+  }, [addTimeline, refreshJobs]);
 
-  const chooseRepository = async () => {
+  useEffect(() => {
+    if (!runId || activeJobId) return;
+    const persistedJob = jobs.jobs.find((job) => job.activeRunId === runId);
+    if (persistedJob) {
+      setActiveJobId(persistedJob.id);
+      setSelectedSkillId(persistedJob.skillId);
+      setView("plan");
+    }
+  }, [activeJobId, jobs, runId]);
+
+  const applyProjectSettings = (nextProjects: ProjectSettings) => {
+    setProjects(nextProjects);
+    const nextActive = nextProjects.projects.find(
+      (project) => project.id === nextProjects.activeProjectId,
+    );
+    setRepository(nextActive?.workspacePath ?? nextActive?.canonicalPath ?? "");
+    invalidatePreflight();
+  };
+
+  const addSavedProject = async () => {
     try {
       const selected = await open({
         directory: true,
         multiple: false,
-        title: "Select the exact repository for plan-only analysis",
+        title: "Add a project to Pimp Code",
       });
-      if (typeof selected === "string") {
-        setRepository(selected);
-        invalidatePreflight();
-      }
+      if (typeof selected !== "string") return;
+      setSavingSettings(true);
+      const value = await invoke<unknown>("add_saved_project", {
+        path: selected,
+      });
+      const nextProjects = normalizeProjectSettings(value);
+      applyProjectSettings(nextProjects);
+      setActiveJobId("");
+      setView("skills");
+      setNotice({ tone: "success", message: "Project saved and selected." });
     } catch (error) {
       setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setSavingSettings(false);
     }
   };
+
+  const selectSavedProject = async (projectId: string) => {
+    if (!projectId || projectId === projects.activeProjectId) return;
+    setSavingSettings(true);
+    try {
+      const value = await invoke<unknown>("select_saved_project", { projectId });
+      applyProjectSettings(normalizeProjectSettings(value));
+      setActiveJobId("");
+      setView("skills");
+      setNotice({ tone: "success", message: "Active project changed." });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const removeSavedProject = async (projectId: string) => {
+    const project = projects.projects.find((item) => item.id === projectId);
+    if (!project) return;
+    if (
+      !window.confirm(
+        `Remove ${project.name} from the app? Repository files will not be deleted.`,
+      )
+    ) {
+      return;
+    }
+    setSavingSettings(true);
+    try {
+      const value = await invoke<unknown>("remove_saved_project", { projectId });
+      const nextProjects = normalizeProjectSettings(value);
+      applyProjectSettings(nextProjects);
+      if (nextProjects.projects.length === 0) setView("projects");
+      setNotice({ tone: "success", message: "Project removed from the app." });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const selectProviderProfile = (profileId: string) => {
+    activateProviderProfile(
+      providerProfiles.profiles.find((profile) => profile.id === profileId),
+    );
+  };
+
+  const saveProviderProfile = async (profile: ProviderProfileInput) => {
+    setSavingSettings(true);
+    try {
+      const value = await invoke<unknown>("save_provider_profile", { profile });
+      const nextProfiles = normalizeProviderProfileSettings(value);
+      setProviderProfiles(nextProfiles);
+      const saved =
+        nextProfiles.profiles.find((item) => item.id === profile.id) ??
+        nextProfiles.profiles.find((item) =>
+          item.name.localeCompare(profile.name, undefined, { sensitivity: "accent" }) === 0
+        );
+      activateProviderProfile(saved);
+      setNotice({ tone: "success", message: "LLM profile saved." });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const deleteProviderProfile = async (profileId: string) => {
+    const profile = providerProfiles.profiles.find((item) => item.id === profileId);
+    if (!profile || !window.confirm(`Delete the ${profile.name} profile?`)) return;
+    setSavingSettings(true);
+    try {
+      const value = await invoke<unknown>("delete_saved_provider_profile", {
+        profileId,
+      });
+      const nextProfiles = normalizeProviderProfileSettings(value);
+      setProviderProfiles(nextProfiles);
+      activateProviderProfile(nextProfiles.profiles[0]);
+      setNotice({ tone: "success", message: "LLM profile deleted." });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const startSkillJob = async (skill: SkillCatalogEntry) => {
+    if (!activeProject || !isRunnableSkill(skill) || !skill.name) return;
+    setCreatingJob(true);
+    try {
+      const value = await invoke<unknown>("create_durable_job", {
+        request: {
+          projectId: activeProject.id,
+          projectName: activeProject.name,
+          canonicalRepository:
+            activeProject.workspacePath ?? activeProject.canonicalPath,
+          skillId: skill.id,
+          skillName: skill.name,
+          skillDigest: skill.digest,
+          skillRoot: skill.rootPath,
+          provider: providerSnapshot(
+            selectedProviderProfile,
+            selectedProviderProfile?.defaultModel ?? "",
+          ),
+          runMode: "plan",
+          approvalMode: "guided",
+          maxTurns: DEFAULT_MAX_TURNS,
+        },
+      });
+      const job = normalizeJobRecord(value);
+      applyJobRecord(job);
+      setActiveJobId(job.id);
+      setSelectedSkillId(job.skillId);
+      setMaxTurns(job.maxTurns);
+      setOutput("");
+      setTimeline([]);
+      setRunSummary(undefined);
+      setRunId(undefined);
+      invalidatePreflight();
+      if (job.provider) {
+        const profile = providerProfiles.profiles.find(
+          (item) => item.id === job.provider?.profileId,
+        );
+        activateProviderProfile(profile);
+        setModel(job.provider.model);
+      }
+      setView("plan");
+      setNotice({
+        tone: "success",
+        message: "Durable draft created. Setup is saved in job history.",
+      });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setCreatingJob(false);
+    }
+  };
+
+  const openDurableJob = async (jobId: string) => {
+    const job = jobs.jobs.find((item) => item.id === jobId);
+    if (!job || !matchesEditableJob(job)) return;
+    if (running && job.id !== activeJobId) {
+      setNotice({
+        tone: "warning",
+        message: "Finish or cancel the active job before resuming another draft.",
+      });
+      return;
+    }
+    if (job.projectId !== projects.activeProjectId) {
+      await selectSavedProject(job.projectId);
+    }
+    const currentSkill = catalog?.entries.find(
+      (skill) => skill.id === job.skillId && skill.digest === job.skillDigest,
+    );
+    if (!currentSkill) {
+      setNotice({
+        tone: "error",
+        message:
+          "The exact skill version for this draft is no longer in the catalog. Refresh or clone the original skill source before resuming.",
+      });
+      return;
+    }
+    setActiveJobId(job.id);
+    setSelectedSkillId(job.skillId);
+    setRepository(job.canonicalRepository);
+    setMaxTurns(job.maxTurns);
+    setOutput("");
+    setTimeline([]);
+    setRunSummary(undefined);
+    setRunId(job.activeRunId);
+    invalidatePreflight();
+    if (job.provider) {
+      const profile = providerProfiles.profiles.find(
+        (item) =>
+          item.id === job.provider?.profileId &&
+          item.revision === job.provider.profileRevision,
+      );
+      activateProviderProfile(profile);
+      setModel(job.provider.model);
+    }
+    setView("plan");
+  };
+
+  const selectHistoryJob = async (jobId: string) => {
+    setSelectedHistoryJobId(jobId);
+    setHistoryResult("");
+    setLoadingHistoryResult(true);
+    try {
+      const value = await invoke<unknown>("read_job_result", { jobId });
+      setHistoryResult(storedJobResultText(value));
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setLoadingHistoryResult(false);
+    }
+  };
+
+  const saveActiveJobSetup = async (): Promise<JobRecord> => {
+    if (!activeJob) throw new Error("Start or resume a durable job first.");
+    const snapshot = providerSnapshot();
+    if (!snapshot) throw new Error("Choose a saved LLM profile first.");
+    const value = await invoke<unknown>("update_durable_job_setup", {
+      request: {
+        jobId: activeJob.id,
+        provider: snapshot,
+        runMode: "plan",
+        approvalMode: "guided",
+        maxTurns,
+      },
+    });
+    const job = normalizeJobRecord(value);
+    applyJobRecord(job);
+    return job;
+  };
+
+  useEffect(() => {
+    if (
+      !activeJob ||
+      !matchesEditableJob(activeJob) ||
+      !selectedProviderProfile ||
+      !model.trim() ||
+      running
+    ) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      const snapshot = providerSnapshot();
+      if (!snapshot) return;
+      if (jobSetupMatches(activeJob, snapshot, maxTurns)) return;
+      void invoke<unknown>("update_durable_job_setup", {
+        request: {
+          jobId: activeJob.id,
+          provider: snapshot,
+          runMode: "plan",
+          approvalMode: "guided",
+          maxTurns,
+        },
+      })
+        .then((value) => applyJobRecord(normalizeJobRecord(value)))
+        .catch((error: unknown) => {
+          setNotice({
+            tone: "warning",
+            message: `Could not autosave job setup: ${errorMessage(error)}`,
+          });
+        });
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeJob?.id,
+    activeJob?.status,
+    applyJobRecord,
+    maxTurns,
+    model,
+    providerSnapshot,
+    running,
+    selectedProviderProfile,
+  ]);
 
   const chooseSkillRoot = async () => {
     try {
@@ -509,13 +987,6 @@ export function App() {
     invalidatePreflight();
   };
 
-  const changeProvider = (nextProvider: ProviderKind) => {
-    setProviderKind(nextProvider);
-    setModel(nextProvider === "claude" ? "sonnet" : "");
-    invalidateProviderHealth();
-    invalidatePreflight();
-  };
-
   const checkProvider = async () => {
     if (!canCheckProvider) return;
     setCheckingProvider(true);
@@ -547,21 +1018,24 @@ export function App() {
   };
 
   const preparePlan = async () => {
-    if (!canPrepare || !selectedSkill) return;
+    if (!canPrepare || !selectedSkill || !activeJob) return;
     setPreparing(true);
     setNotice(undefined);
     invalidatePreflight();
     const revision = preflightRevision.current;
     try {
+      const persistedJob = await saveActiveJobSetup();
       const rawPreflight = await invoke<unknown>("prepare_plan", {
         repository: repository.trim(),
         skillId: selectedSkill.id,
         skillRoot: selectedSkill.rootPath,
+        jobId: persistedJob.id,
       });
       if (revision !== preflightRevision.current) return;
       const nextPreflight = normalizePreflight(rawPreflight);
       assertPreparedPreflightMatchesSkill(nextPreflight, selectedSkill);
       setPreflight(nextPreflight);
+      await refreshJobs();
       setNotice({
         tone:
           nextPreflight.applicability.verdict === "applicable"
@@ -582,7 +1056,7 @@ export function App() {
   };
 
   const startPlan = async () => {
-    if (!canStart || !preflight) return;
+    if (!canStart || !preflight || !activeJob) return;
     setOutput("");
     setTimeline([]);
     sequence.current = 0;
@@ -599,6 +1073,7 @@ export function App() {
     try {
       const response = await invoke<StartPlanResponse>("start_plan", {
         request: {
+          jobId: activeJob.id,
           preflightId: preflight.id,
           provider,
           maxTurns,
@@ -607,9 +1082,11 @@ export function App() {
         },
       });
       setRunId(response.runId);
+      await refreshJobs();
     } catch (error) {
       setRunning(false);
       addTimeline("Plan could not start", "error", errorMessage(error));
+      void refreshJobs();
     }
   };
 
@@ -624,14 +1101,79 @@ export function App() {
   };
 
   return (
+    <AppShell
+      view={view}
+      projects={projects}
+      activeProject={activeProject}
+      activeProfile={selectedProviderProfile}
+      activeJob={activeJob}
+      running={running}
+      onNavigate={setView}
+      onSelectProject={selectSavedProject}
+    >
+      {view !== "plan" && notice ? (
+        <div
+          className={`app-notice management-notice ${notice.tone}`}
+          role={notice.tone === "error" ? "alert" : "status"}
+        >
+          <span aria-hidden="true" />
+          {notice.message}
+        </div>
+      ) : null}
+      {view === "skills" ? (
+        <SkillsPage
+          projectName={activeProject?.name ?? "No active project"}
+          catalog={catalog}
+          skillRoots={skillRoots}
+          loading={loadingRoots || scanningCatalog}
+          starting={creatingJob || running}
+          onRefresh={() => void scanRoots(skillRoots, "Project skill catalog refreshed.")}
+          onStartJob={startSkillJob}
+          onBrowseRoot={() => void chooseSkillRoot()}
+          onAddRoot={() => setSkillRoots((roots) => [...roots, ""])}
+          onUpdateRoot={updateSkillRoot}
+          onRemoveRoot={removeSkillRoot}
+          onSaveRoots={() => void saveAndScanRoots()}
+        />
+      ) : view === "jobs" ? (
+        <JobsPage
+          jobs={jobs.jobs}
+          activeProjectId={activeProject?.id ?? ""}
+          selectedJobId={selectedHistoryJobId}
+          resultText={historyResult}
+          loadingResult={loadingHistoryResult}
+          onSelectJob={(jobId) => void selectHistoryJob(jobId)}
+          onOpenJob={(jobId) => void openDurableJob(jobId)}
+        />
+      ) : view === "projects" ? (
+        <ProjectsPage
+          settings={projects}
+          busy={loadingSettings || savingSettings || running}
+          onAdd={addSavedProject}
+          onSelect={selectSavedProject}
+          onRemove={removeSavedProject}
+          onOpenPlan={() => setView("skills")}
+        />
+      ) : view === "providers" ? (
+        <ProviderProfilesPage
+          profiles={providerProfiles.profiles}
+          selectedProfileId={selectedProviderProfileId}
+          busy={loadingSettings || savingSettings}
+          onSelect={selectProviderProfile}
+          onSave={saveProviderProfile}
+          onDelete={deleteProviderProfile}
+        />
+      ) : (
     <main className="shell">
       <header className="hero">
         <div>
-          <p className="eyebrow">Read-only vertical slice</p>
-          <h1>Plan a safe codebase migration</h1>
+          <p className="eyebrow">
+            Durable job {activeJob ? `· ${activeJob.id.slice(0, 12)}` : ""}
+          </p>
+          <h1>{activeJob?.skillName ?? "Plan a safe codebase migration"}</h1>
           <p className="subtitle">
-            Pin the repository and skill package, inspect the exact context, then
-            run a structured plan without modifying the target project.
+            Review the saved project, immutable skill package, execution mode and LLM
+            profile before preparing exact context.
           </p>
         </div>
         <span className={`status-pill ${running ? "active" : ""}`}>
@@ -696,37 +1238,31 @@ export function App() {
               <span>01</span>
               <div>
                 <h2 id="repository-heading">Repository</h2>
-                <p>Choose the exact folder. The engine will canonicalize it.</p>
+                <p>The active saved project defines the exact read boundary.</p>
               </div>
             </div>
-            <div className="picker-row">
-              <label className="sr-only" htmlFor="repository-path">
-                Repository path
-              </label>
-              <input
-                id="repository-path"
-                value={repository}
-                onChange={(event) => {
-                  setRepository(event.target.value);
-                  invalidatePreflight();
-                }}
-                placeholder="Select a repository"
-                spellCheck={false}
-              />
-              <button type="button" className="secondary" onClick={chooseRepository}>
-                Browse
+            <div className="selected-project-card">
+              <div>
+                <strong>{activeProject?.name ?? "No project selected"}</strong>
+                <code>{repository || "Add a project from the project library."}</code>
+              </div>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setView("projects")}
+              >
+                Manage
               </button>
             </div>
           </section>
 
-          <section className="flow-section" aria-labelledby="skill-heading">
+          <section className="flow-section job-skill-lock" aria-labelledby="skill-heading">
             <div className="section-heading heading-with-action">
               <span>02</span>
               <div>
-                <h2 id="skill-heading">Skill catalog</h2>
+                <h2 id="skill-heading">Selected skill</h2>
                 <p>
-                  Catalog validity and execution certification are independent;
-                  scripts stay inactive.
+                  This job is pinned to the exact package digest shown below.
                 </p>
               </div>
               <button
@@ -809,7 +1345,7 @@ export function App() {
                         name="skill"
                         value={entry.id}
                         checked={selectedSkillId === entry.id}
-                        disabled={!runnable}
+                        disabled={!runnable || Boolean(activeJob)}
                         onChange={() => selectSkill(entry)}
                       />
                       <span className="skill-card-body">
@@ -909,53 +1445,82 @@ export function App() {
             <div className="section-heading">
               <span>03</span>
               <div>
-                <h2 id="provider-heading">Provider &amp; limits</h2>
-                <p>Test the runtime, identify the model source, then set a turn budget.</p>
+                <h2 id="provider-heading">Mode, provider &amp; limits</h2>
+                <p>Choose how the saved job should progress, then select its LLM profile.</p>
               </div>
             </div>
 
-            <div className="segmented" role="group" aria-label="Provider">
+            <fieldset className="execution-mode-picker">
+              <legend>Execution mode</legend>
+              <label className="selected">
+                <input type="radio" name="execution-mode" checked readOnly />
+                <span>
+                  <strong>Plan only</strong>
+                  <small>Inspect, generate and save a plan. No project changes.</small>
+                </span>
+                <i>Available</i>
+              </label>
+              <label className="disabled" aria-disabled="true">
+                <input type="radio" name="execution-mode" disabled />
+                <span>
+                  <strong>Guided job</strong>
+                  <small>Approve the persisted plan before guarded execution.</small>
+                </span>
+                <i>Not certified</i>
+              </label>
+              <label className="disabled" aria-disabled="true">
+                <input type="radio" name="execution-mode" disabled />
+                <span>
+                  <strong>Continuous job</strong>
+                  <small>Continue inside the approved capability envelope.</small>
+                </span>
+                <i>Not certified</i>
+              </label>
+            </fieldset>
+
+            <div className="profile-picker-row">
+              <label className="field" htmlFor="provider-profile">
+                <span>Saved LLM profile</span>
+                <select
+                  id="provider-profile"
+                  value={selectedProviderProfileId}
+                  onChange={(event) => selectProviderProfile(event.target.value)}
+                >
+                  {providerProfiles.profiles.length === 0 ? (
+                    <option value="">No profiles configured</option>
+                  ) : null}
+                  {providerProfiles.profiles.map((profile) => (
+                    <option value={profile.id} key={profile.id}>
+                      {profile.name} · {profile.defaultModel}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <button
-                className={providerKind === "local" ? "selected" : ""}
-                aria-pressed={providerKind === "local"}
-                onClick={() => changeProvider("local")}
                 type="button"
+                className="text-button"
+                onClick={() => setView("providers")}
               >
-                Local bridge
-              </button>
-              <button
-                className={providerKind === "claude" ? "selected" : ""}
-                aria-pressed={providerKind === "claude"}
-                onClick={() => changeProvider("claude")}
-                type="button"
-              >
-                Claude
+                Manage profiles
               </button>
             </div>
 
-            {providerKind === "local" ? (
-              <label className="field" htmlFor="provider-endpoint">
-                <span>OpenAI-compatible loopback endpoint</span>
-                <input
-                  id="provider-endpoint"
-                  value={endpoint}
-                  onChange={(event) => {
-                    setEndpoint(event.target.value);
-                    invalidateProviderHealth();
-                    invalidatePreflight();
-                  }}
-                  placeholder={DEFAULT_ENDPOINT}
-                  spellCheck={false}
-                />
-                <small>
-                  Compatibility bridge for the packaged Claude Code runtime; not a
-                  native LM Studio or Ollama adapter.
-                </small>
-              </label>
+            {selectedProviderProfile ? (
+              <div className="inline-note profile-summary">
+                <strong>
+                  {selectedProviderProfile.kind === "claude"
+                    ? "Claude profile"
+                    : "Local compatibility profile"}
+                </strong>
+                {selectedProviderProfile.endpoint ? (
+                  <code>{selectedProviderProfile.endpoint}</code>
+                ) : (
+                  <span>Credentials remain in the trusted host environment.</span>
+                )}
+              </div>
             ) : (
               <div className="inline-note">
-                Claude credentials remain in the host environment and never enter
-                React state. Context egress requires a separate approval below.
+                Create a saved LLM profile before preparing this job.
               </div>
             )}
 
@@ -1003,6 +1568,7 @@ export function App() {
                           )
                         : DEFAULT_MAX_TURNS,
                     );
+                    invalidatePreflight();
                   }}
                 />
               </label>
@@ -1386,5 +1952,7 @@ export function App() {
         </section>
       </div>
     </main>
+      )}
+    </AppShell>
   );
 }

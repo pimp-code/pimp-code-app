@@ -3,7 +3,7 @@ import {
   MIGRATE_TO_VITE_PLAN_V1_SCHEMA,
   buildMigrateToVitePlanPrompt,
   renderMigrateToVitePlanMarkdown,
-  validateMigrateToVitePlanV1,
+  validateMigrateToViteProviderPlanV1,
   type MigrateToVitePlanV1,
 } from "./migrate-to-vite-plan.js";
 import {
@@ -19,7 +19,7 @@ import {
   UPGRADE_REACT_ROUTER_TO_V8_PLAN_V1_SCHEMA,
   buildUpgradeReactRouterToV8PlanPrompt,
   renderUpgradeReactRouterToV8PlanMarkdown,
-  validateUpgradeReactRouterToV8PlanV1,
+  validateUpgradeReactRouterToV8ProviderPlanV1,
   type UpgradeReactRouterToV8PlanV1,
 } from "./upgrade-react-router-to-v8-plan.js";
 import {
@@ -73,7 +73,7 @@ export function getPlanningAdapter(preflight: PlanningPreflight): BoundPlanningA
         preflight: migratePreflight,
         ...(userGoal ? { userGoal } : {}),
       }),
-      validate: (value) => validateMigrateToVitePlanV1(value, migratePreflight),
+      validate: (value) => validateMigrateToViteProviderPlanV1(value, migratePreflight),
       render: (plan) => {
         if (plan.schemaVersion !== MIGRATE_TO_VITE_PLAN_SCHEMA_VERSION) {
           throw new Error("Plan does not match the migrate-to-vite adapter");
@@ -91,7 +91,7 @@ export function getPlanningAdapter(preflight: PlanningPreflight): BoundPlanningA
       preflight: routerPreflight,
       ...(userGoal ? { userGoal } : {}),
     }),
-    validate: (value) => validateUpgradeReactRouterToV8PlanV1(value, routerPreflight),
+    validate: (value) => validateUpgradeReactRouterToV8ProviderPlanV1(value, routerPreflight),
     render: (plan) => {
       if (plan.schemaVersion !== UPGRADE_REACT_ROUTER_TO_V8_PLAN_SCHEMA_VERSION) {
         throw new Error("Plan does not match the upgrade-react-router-to-v8 adapter");

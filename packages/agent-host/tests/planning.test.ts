@@ -902,7 +902,7 @@ test("artifact writer creates immutable contained JSON and Markdown outside the 
   }
 });
 
-test("plan runner gives the provider only the approved snapshot and zero tools", async () => {
+test("plan runner gives the provider only the approved snapshot and the structured output formatter", async () => {
   const fixture = await makeFixture();
   const previousApiKey = process.env.ANTHROPIC_API_KEY;
   process.env.ANTHROPIC_API_KEY = "planning-test-key";
@@ -913,12 +913,30 @@ test("plan runner gives the provider only the approved snapshot and zero tools",
       capturedQuery = request;
       return {
         async *[Symbol.asyncIterator]() {
+          const providerPlan = planFor(fixture.preflight);
+          providerPlan.applicability = {
+            status: "already-vite",
+            rationale: "Provider reinterpreted trusted applicability.",
+            evidence: [],
+          };
+          providerPlan.filesInspected = [];
           yield {
             type: "system",
             subtype: "init",
             claude_code_version: "test",
             model: "sonnet",
-            tools: [],
+            tools: ["StructuredOutput"],
+          };
+          yield {
+            type: "assistant",
+            message: {
+              content: [{
+                type: "tool_use",
+                id: "structured-output-1",
+                name: "StructuredOutput",
+                input: planFor(fixture.preflight),
+              }],
+            },
           };
           yield {
             type: "result",
@@ -927,7 +945,7 @@ test("plan runner gives the provider only the approved snapshot and zero tools",
             num_turns: 1,
             result: "",
             session_id: "planning-test-session",
-            structured_output: planFor(fixture.preflight),
+            structured_output: providerPlan,
             total_cost_usd: 0.0125,
             usage: { input_tokens: 40, output_tokens: 60 },
           };
@@ -984,10 +1002,21 @@ test("plan runner gives the provider only the approved snapshot and zero tools",
       (event) => event.type === "status" && event.phase === "agent-initialized",
     );
     assert.ok(initializedStatus?.type === "status");
-    assert.deepEqual(initializedStatus.details?.tools, []);
+    assert.deepEqual(initializedStatus.details?.tools, ["StructuredOutput"]);
 
     const result = events.find((event) => event.type === "result");
     assert.ok(result?.type === "result" && result.success);
+    assert.ok(typeof result.result === "object" && result.result !== null);
+    const trustedPlan = result.result.json as MigrateToVitePlanV1;
+    assert.deepEqual(trustedPlan.applicability, {
+      status: fixture.preflight.applicability.status,
+      rationale: fixture.preflight.applicability.rationale,
+      evidence: fixture.preflight.applicability.evidence,
+    });
+    assert.deepEqual(
+      trustedPlan.filesInspected,
+      fixture.preflight.context.manifest.files.map((file) => file.relativePath).sort(),
+    );
     assert.equal(result.metadata?.provider, "claude");
     assert.equal(result.metadata?.contextHash, fixture.preflight.context.manifest.manifestSha256);
     assert.equal(result.metadata?.usage?.totalTokens, 100);

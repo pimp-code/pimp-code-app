@@ -239,6 +239,34 @@ test("router plan schema, validator, prompt, renderer, and generic artifacts sta
     assert.throws(() => validateUpgradeReactRouterToV8PlanV1(unsafe, fixture.preflight), PlanValidationError);
     const adapter = getPlanningAdapter(fixture.preflight);
     assert.equal(adapter.skillName, "upgrade-react-router-to-v8");
+    const providerEcho = structuredClone(plan);
+    providerEcho.applicability.status = "already-v8";
+    providerEcho.applicability.rationale = "Provider reinterpreted trusted evidence.";
+    providerEcho.applicability.versions = [];
+    providerEcho.inventory.currentVersions = [];
+    providerEcho.inventory.legacyApis = [];
+    providerEcho.filesInspected = [];
+    providerEcho.routeParity.push({
+      routePattern: "/unsupported",
+      currentBehavior: "The provider invented an unsupported route.",
+      proposedV8Behavior: "The provider proposed unsupported behavior.",
+      evidence: [],
+      risks: [],
+    });
+    providerEcho.verification.push({
+      id: "empty-command",
+      title: "Invalid empty command",
+      executable: "",
+      args: [],
+      purpose: "This malformed proposal must be removed.",
+      expectedOutcome: "It never runs.",
+      requiresApproval: true,
+    });
+    assert.throws(
+      () => validateUpgradeReactRouterToV8PlanV1(providerEcho, fixture.preflight),
+      /must match the trusted preflight exactly/u,
+    );
+    assert.deepEqual(adapter.validate(providerEcho), plan);
     assert.equal(isPlanningSkillSupported("upgrade-react-router-to-v8"), true);
     assert.equal(
       isCertifiedPlanningSkillIdentity(

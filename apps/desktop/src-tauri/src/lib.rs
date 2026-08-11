@@ -19,6 +19,21 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod jobs;
+mod settings;
+
+use jobs::{
+    CreateJobRequest, JobProviderKind, JobRecord, JobStore, UpdateJobSetupRequest,
+    attach_preflight, begin_attempt, create_job as create_job_record, fail_start,
+    read_job_events as load_job_events, read_job_result as load_job_result, reconcile_jobs,
+    record_agent_event, update_job_setup as update_job_setup_record,
+};
+use settings::{
+    ProjectSettings, ProviderProfileInput, ProviderProfileKind, ProviderProfileSettings,
+    add_project, delete_provider_profile, load_projects, load_provider_profiles, remove_project,
+    save_projects, save_provider_profiles, select_project, upsert_provider_profile,
+};
+
 const MAX_UTILITY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGENT_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SKILL_ROOTS: usize = 16;
@@ -58,6 +73,7 @@ enum ProviderConfig {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PlanStartRequest {
+    job_id: String,
     preflight_id: String,
     max_turns: u8,
     provider: ProviderConfig,
@@ -295,6 +311,27 @@ fn skill_roots_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("Could not resolve app configuration directory: {error}"))
 }
 
+fn project_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("projects.json"))
+        .map_err(|error| format!("Could not resolve app configuration directory: {error}"))
+}
+
+fn provider_profiles_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("provider-profiles.json"))
+        .map_err(|error| format!("Could not resolve app configuration directory: {error}"))
+}
+
+fn job_storage_root(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join("jobs"))
+        .map_err(|error| format!("Could not resolve app data directory: {error}"))
+}
+
 #[cfg(debug_assertions)]
 fn development_skill_root() -> Option<String> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -360,6 +397,158 @@ fn save_skill_roots(app: AppHandle, roots: Vec<String>) -> Result<Vec<String>, S
     fs::rename(&temporary, &path)
         .map_err(|error| format!("Could not publish {}: {error}", path.display()))?;
     Ok(roots)
+}
+
+#[tauri::command]
+fn list_projects(app: AppHandle) -> Result<ProjectSettings, String> {
+    load_projects(&project_settings_path(&app)?)
+}
+
+#[tauri::command]
+fn add_saved_project(
+    app: AppHandle,
+    path: String,
+    name: Option<String>,
+) -> Result<ProjectSettings, String> {
+    let settings_path = project_settings_path(&app)?;
+    let mut settings = load_projects(&settings_path)?;
+    add_project(&mut settings, path, name)?;
+    save_projects(&settings_path, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn select_saved_project(app: AppHandle, project_id: String) -> Result<ProjectSettings, String> {
+    let settings_path = project_settings_path(&app)?;
+    let mut settings = load_projects(&settings_path)?;
+    select_project(&mut settings, &project_id)?;
+    save_projects(&settings_path, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn remove_saved_project(app: AppHandle, project_id: String) -> Result<ProjectSettings, String> {
+    let settings_path = project_settings_path(&app)?;
+    let mut settings = load_projects(&settings_path)?;
+    remove_project(&mut settings, &project_id)?;
+    save_projects(&settings_path, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn list_provider_profiles(app: AppHandle) -> Result<ProviderProfileSettings, String> {
+    load_provider_profiles(&provider_profiles_settings_path(&app)?)
+}
+
+#[tauri::command]
+fn save_provider_profile(
+    app: AppHandle,
+    profile: ProviderProfileInput,
+) -> Result<ProviderProfileSettings, String> {
+    let settings_path = provider_profiles_settings_path(&app)?;
+    let mut settings = load_provider_profiles(&settings_path)?;
+    upsert_provider_profile(&mut settings, profile)?;
+    save_provider_profiles(&settings_path, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn delete_saved_provider_profile(
+    app: AppHandle,
+    profile_id: String,
+) -> Result<ProviderProfileSettings, String> {
+    let settings_path = provider_profiles_settings_path(&app)?;
+    let mut settings = load_provider_profiles(&settings_path)?;
+    delete_provider_profile(&mut settings, &profile_id)?;
+    save_provider_profiles(&settings_path, &settings)?;
+    Ok(settings)
+}
+
+fn validate_job_provider_snapshot(
+    app: &AppHandle,
+    snapshot: &jobs::JobProviderSnapshot,
+) -> Result<(), String> {
+    let profiles = load_provider_profiles(&provider_profiles_settings_path(app)?)?;
+    let profile = profiles
+        .profiles
+        .iter()
+        .find(|profile| profile.id == snapshot.profile_id)
+        .ok_or_else(|| "The selected provider profile no longer exists".to_string())?;
+    let kind_matches = matches!(
+        (&profile.kind, snapshot.kind),
+        (ProviderProfileKind::Claude, JobProviderKind::Claude)
+            | (ProviderProfileKind::Local, JobProviderKind::Local)
+    );
+    if profile.revision != snapshot.profile_revision
+        || profile.name != snapshot.profile_name
+        || !kind_matches
+        || profile.endpoint != snapshot.endpoint
+    {
+        return Err("The provider profile changed; select it again before continuing".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_jobs(
+    app: AppHandle,
+    state: State<'_, AgentProcessState>,
+) -> Result<JobStore, String> {
+    let active_run_id = state
+        .active
+        .lock()
+        .await
+        .as_ref()
+        .map(|active| active.run_id.clone());
+    reconcile_jobs(&job_storage_root(&app)?, active_run_id.as_deref())
+}
+
+#[tauri::command]
+fn create_durable_job(app: AppHandle, mut request: CreateJobRequest) -> Result<JobRecord, String> {
+    let projects = load_projects(&project_settings_path(&app)?)?;
+    let project = projects
+        .projects
+        .iter()
+        .find(|project| project.id == request.project_id)
+        .ok_or_else(|| "The selected project no longer exists".to_string())?;
+    let expected_repository = project
+        .workspace_path
+        .as_ref()
+        .unwrap_or(&project.canonical_path);
+    if !expected_repository.eq_ignore_ascii_case(request.canonical_repository.trim()) {
+        return Err("The durable job repository does not match the saved project".to_string());
+    }
+    if !read_skill_roots(&app)?
+        .iter()
+        .any(|root| root.eq_ignore_ascii_case(request.skill_root.trim()))
+    {
+        return Err("The selected skill root is not configured".to_string());
+    }
+    if let Some(provider) = &request.provider {
+        validate_job_provider_snapshot(&app, provider)?;
+    }
+    request.project_name = project.name.clone();
+    request.canonical_repository = expected_repository.clone();
+    create_job_record(&job_storage_root(&app)?, request)
+}
+
+#[tauri::command]
+fn update_durable_job_setup(
+    app: AppHandle,
+    request: UpdateJobSetupRequest,
+) -> Result<JobRecord, String> {
+    validate_job_provider_snapshot(&app, &request.provider)?;
+    update_job_setup_record(&job_storage_root(&app)?, request)
+}
+
+#[tauri::command]
+fn read_job_result(app: AppHandle, job_id: String) -> Result<Option<Value>, String> {
+    load_job_result(&job_storage_root(&app)?, &job_id)
+}
+
+#[tauri::command]
+fn read_job_events(app: AppHandle, job_id: String) -> Result<Vec<Value>, String> {
+    load_job_events(&job_storage_root(&app)?, &job_id)
 }
 
 async fn run_agent_utility(app: &AppHandle, request: Value) -> Result<Value, String> {
@@ -468,6 +657,7 @@ async fn prepare_plan(
     repository: String,
     skill_id: String,
     skill_root: String,
+    job_id: Option<String>,
 ) -> Result<Value, String> {
     if repository.trim().is_empty()
         || repository.len() > MAX_REPOSITORY_LENGTH
@@ -506,12 +696,45 @@ async fn prepare_plan(
         &configured_roots,
         &preflight_root,
     );
-    run_agent_utility(&app, request).await
+    let preflight = run_agent_utility(&app, request).await?;
+    if let Some(job_id) = job_id {
+        attach_preflight(&job_storage_root(&app)?, &job_id, &preflight)?;
+    }
+    Ok(preflight)
 }
 
-fn emit_diagnostic(app: &AppHandle, run_id: &str, level: &str, message: impl Into<String>) {
-    let _ = app.emit(
-        "agent-event",
+fn emit_agent_event(app: &AppHandle, job_id: Option<&str>, event: Value) {
+    if let Some(job_id) = job_id
+        && let Ok(root) = job_storage_root(app)
+        && let Err(error) = record_agent_event(&root, job_id, &event)
+    {
+        let run_id = event
+            .get("runId")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let _ = app.emit(
+            "agent-event",
+            json!({
+                "type": "diagnostic",
+                "runId": run_id,
+                "level": "error",
+                "message": sanitize_diagnostic(format!("Could not persist job history: {error}"))
+            }),
+        );
+    }
+    let _ = app.emit("agent-event", event);
+}
+
+fn emit_diagnostic(
+    app: &AppHandle,
+    run_id: &str,
+    level: &str,
+    message: impl Into<String>,
+    job_id: Option<&str>,
+) {
+    emit_agent_event(
+        app,
+        job_id,
         json!({
             "type": "diagnostic",
             "runId": run_id,
@@ -526,9 +749,11 @@ fn emit_host_exit_result(
     run_id: &str,
     cancelled: bool,
     message: impl Into<String>,
+    job_id: Option<&str>,
 ) {
-    let _ = app.emit(
-        "agent-event",
+    emit_agent_event(
+        app,
+        job_id,
         json!({
             "type": "result",
             "runId": run_id,
@@ -623,6 +848,7 @@ async fn spawn_agent_host(
     state: State<'_, AgentProcessState>,
     run_id: String,
     start_message: Value,
+    job_id: Option<String>,
 ) -> Result<AgentStartResponse, String> {
     let mut active_guard = state.active.lock().await;
     if let Some(active) = active_guard.as_ref() {
@@ -686,6 +912,7 @@ async fn spawn_agent_host(
 
     let stdout_app = app.clone();
     let stdout_run_id = run_id.clone();
+    let stdout_job_id = job_id.clone();
     let terminal_result_seen = Arc::new(AtomicBool::new(false));
     let stdout_terminal_result_seen = terminal_result_seen.clone();
     let stdout_task = tauri::async_runtime::spawn(async move {
@@ -697,6 +924,7 @@ async fn spawn_agent_host(
                     &stdout_run_id,
                     "error",
                     "Rejected oversized agent event",
+                    stdout_job_id.as_deref(),
                 ),
                 Ok(Some(line)) => match serde_json::from_str::<Value>(&line)
                     .map_err(|error| error.to_string())
@@ -706,13 +934,14 @@ async fn spawn_agent_host(
                         if event.get("type").and_then(Value::as_str) == Some("result") {
                             stdout_terminal_result_seen.store(true, Ordering::Release);
                         }
-                        let _ = stdout_app.emit("agent-event", event);
+                        emit_agent_event(&stdout_app, stdout_job_id.as_deref(), event);
                     }
                     Err(error) => emit_diagnostic(
                         &stdout_app,
                         &stdout_run_id,
                         "warning",
                         format!("Rejected agent event: {error}"),
+                        stdout_job_id.as_deref(),
                     ),
                 },
                 Ok(None) => break,
@@ -722,6 +951,7 @@ async fn spawn_agent_host(
                         &stdout_run_id,
                         "error",
                         format!("Agent stdout failed: {error}"),
+                        stdout_job_id.as_deref(),
                     );
                     break;
                 }
@@ -731,17 +961,25 @@ async fn spawn_agent_host(
 
     let stderr_app = app.clone();
     let stderr_run_id = run_id.clone();
+    let stderr_job_id = job_id.clone();
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if !line.trim().is_empty() {
-                emit_diagnostic(&stderr_app, &stderr_run_id, "warning", line);
+                emit_diagnostic(
+                    &stderr_app,
+                    &stderr_run_id,
+                    "warning",
+                    line,
+                    stderr_job_id.as_deref(),
+                );
             }
         }
     });
 
     let wait_app = app.clone();
     let wait_run_id = run_id.clone();
+    let wait_job_id = job_id;
     tauri::async_runtime::spawn(async move {
         let exit = child.wait().await;
         let _ = stdout_task.await;
@@ -755,6 +993,7 @@ async fn spawn_agent_host(
                 &wait_run_id,
                 cancellation_requested.load(Ordering::Acquire),
                 detail,
+                wait_job_id.as_deref(),
             );
         }
         clear_active_run(&wait_app, &wait_run_id).await;
@@ -786,7 +1025,7 @@ async fn start_agent(
         "provider": request.provider,
     });
 
-    spawn_agent_host(app, state, run_id, start_message).await
+    spawn_agent_host(app, state, run_id, start_message, None).await
 }
 
 #[tauri::command]
@@ -803,10 +1042,11 @@ async fn start_plan(
     if !(1..=20).contains(&request.max_turns) {
         return Err("maxTurns must be between 1 and 20".to_string());
     }
-    let model = match &request.provider {
-        ProviderConfig::Claude { model } | ProviderConfig::Local { model, .. } => model,
+    let (model, job_provider_kind) = match &request.provider {
+        ProviderConfig::Claude { model } => (model.trim().to_string(), JobProviderKind::Claude),
+        ProviderConfig::Local { model, .. } => (model.trim().to_string(), JobProviderKind::Local),
     };
-    if model.trim().is_empty() || model.len() > 200 || model.chars().any(char::is_control) {
+    if model.is_empty() || model.len() > 200 || model.chars().any(char::is_control) {
         return Err("A valid provider model is required".to_string());
     }
     if matches!(&request.provider, ProviderConfig::Claude { .. }) && !request.remote_egress_approved
@@ -831,6 +1071,16 @@ async fn start_plan(
     }
 
     let run_id = Uuid::new_v4().to_string();
+    let jobs_root = job_storage_root(&app)?;
+    begin_attempt(
+        &jobs_root,
+        &request.job_id,
+        &run_id,
+        &request.preflight_id,
+        job_provider_kind,
+        &model,
+        request.max_turns,
+    )?;
     let start_message = json!({
         "type": "start_plan",
         "runId": run_id,
@@ -839,7 +1089,22 @@ async fn start_plan(
         "provider": request.provider,
         "remoteEgressApproved": request.remote_egress_approved,
     });
-    spawn_agent_host(app, state, run_id, start_message).await
+    let job_id = request.job_id;
+    match spawn_agent_host(
+        app,
+        state,
+        run_id.clone(),
+        start_message,
+        Some(job_id.clone()),
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let _ = fail_start(&jobs_root, &job_id, &run_id, &error);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -924,6 +1189,18 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_skill_roots,
             save_skill_roots,
+            list_projects,
+            add_saved_project,
+            select_saved_project,
+            remove_saved_project,
+            list_provider_profiles,
+            save_provider_profile,
+            delete_saved_provider_profile,
+            list_jobs,
+            create_durable_job,
+            update_durable_job_setup,
+            read_job_result,
+            read_job_events,
             scan_skill_catalog,
             prepare_plan,
             provider_health,
