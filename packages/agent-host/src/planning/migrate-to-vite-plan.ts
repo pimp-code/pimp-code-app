@@ -325,7 +325,7 @@ export class PlanValidationError extends Error {
   readonly issues: string[];
 
   constructor(issues: string[]) {
-    super(`Invalid migrate-to-vite plan: ${issues.join("; ")}`);
+    super(`Invalid planning output: ${issues.join("; ")}`);
     this.name = "PlanValidationError";
     this.issues = issues;
   }
@@ -942,6 +942,30 @@ export function validateMigrateToVitePlanV1(
   }
   if (context.issues.length > 0) throw new PlanValidationError(context.issues);
   return plan;
+}
+
+export function validateMigrateToViteProviderPlanV1(
+  value: unknown,
+  preflight: MigrateToVitePreflight,
+): MigrateToVitePlanV1 {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return validateMigrateToVitePlanV1(value, preflight);
+  }
+  const providerPlan = value as Record<string, unknown>;
+  return validateMigrateToVitePlanV1(
+    {
+      ...providerPlan,
+      applicability: {
+        status: preflight.applicability.status,
+        rationale: preflight.applicability.rationale,
+        evidence: preflight.applicability.evidence.map((entry) => ({ ...entry })),
+      },
+      filesInspected: preflight.context.manifest.files
+        .map((file) => file.relativePath)
+        .sort(),
+    },
+    preflight,
+  );
 }
 
 export function parseMigrateToVitePlanV1(

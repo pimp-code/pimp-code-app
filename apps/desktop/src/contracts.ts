@@ -13,6 +13,109 @@ export interface LocalProviderConfig {
 
 export type ProviderConfig = ClaudeProviderConfig | LocalProviderConfig;
 
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  configuredPath: string;
+  canonicalPath: string;
+  workspacePath?: string;
+  defaultProviderProfileId?: string;
+  defaultModel?: string;
+  createdAt: number;
+  updatedAt: number;
+  lastOpenedAt?: number;
+}
+
+export interface ProjectSettings {
+  version: number;
+  activeProjectId?: string;
+  projects: ProjectRecord[];
+}
+
+export interface ProviderProfileRecord {
+  id: string;
+  name: string;
+  kind: ProviderKind;
+  endpoint?: string;
+  defaultModel: string;
+  credentialRef?: string;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProviderProfileInput {
+  id?: string;
+  name: string;
+  kind: ProviderKind;
+  endpoint?: string;
+  defaultModel: string;
+  credentialRef?: string;
+}
+
+export interface ProviderProfileSettings {
+  version: number;
+  profiles: ProviderProfileRecord[];
+}
+
+export type JobRunMode = "plan" | "apply";
+export type JobApprovalMode = "guided" | "continuous";
+export type JobStatus =
+  | "draft"
+  | "ready"
+  | "planning"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "blocked";
+
+export interface JobProviderSnapshot {
+  profileId: string;
+  profileRevision: number;
+  profileName: string;
+  kind: ProviderKind;
+  endpoint?: string;
+  model: string;
+}
+
+export interface JobAttempt {
+  runId: string;
+  startedAt: number;
+  finishedAt?: number;
+  outcome?: JobStatus;
+}
+
+export interface JobRecord {
+  id: string;
+  projectId: string;
+  projectName: string;
+  canonicalRepository: string;
+  skillId: string;
+  skillName: string;
+  skillDigest: string;
+  skillRoot: string;
+  provider?: JobProviderSnapshot;
+  runMode: JobRunMode;
+  approvalMode: JobApprovalMode;
+  maxTurns: number;
+  status: JobStatus;
+  currentStage: string;
+  preflightId?: string;
+  activeRunId?: string;
+  attempts: JobAttempt[];
+  resultPath?: string;
+  artifactPaths: string[];
+  lastError?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface JobStore {
+  version: number;
+  jobs: JobRecord[];
+}
+
 export type CatalogEntryStatus =
   | "valid"
   | "malformed"
@@ -235,6 +338,178 @@ function asBoolean(value: unknown, fallback = false): boolean {
 
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+export function normalizeProjectSettings(value: unknown): ProjectSettings {
+  const settings = asRecord(value);
+  const projects = asArray(settings.projects)
+    .map((raw): ProjectRecord => {
+      const project = asRecord(raw);
+      return {
+        id: asString(project.id),
+        name: asString(project.name, "Unnamed project"),
+        configuredPath: asString(at(project, "configuredPath", "configured_path")),
+        canonicalPath: asString(at(project, "canonicalPath", "canonical_path")),
+        workspacePath:
+          asString(at(project, "workspacePath", "workspace_path")) || undefined,
+        defaultProviderProfileId:
+          asString(
+            at(
+              project,
+              "defaultProviderProfileId",
+              "default_provider_profile_id",
+            ),
+          ) || undefined,
+        defaultModel:
+          asString(at(project, "defaultModel", "default_model")) || undefined,
+        createdAt: asNumber(at(project, "createdAt", "created_at")),
+        updatedAt: asNumber(at(project, "updatedAt", "updated_at")),
+        lastOpenedAt:
+          asNumber(at(project, "lastOpenedAt", "last_opened_at")) || undefined,
+      };
+    })
+    .filter((project) => project.id && project.canonicalPath);
+  const activeProjectId = asString(
+    at(settings, "activeProjectId", "active_project_id"),
+  );
+  return {
+    version: asNumber(settings.version, 1),
+    activeProjectId:
+      activeProjectId && projects.some((project) => project.id === activeProjectId)
+        ? activeProjectId
+        : projects[0]?.id,
+    projects,
+  };
+}
+
+export function normalizeProviderProfileSettings(
+  value: unknown,
+): ProviderProfileSettings {
+  const settings = asRecord(value);
+  return {
+    version: asNumber(settings.version, 1),
+    profiles: asArray(settings.profiles)
+      .map((raw): ProviderProfileRecord => {
+        const profile = asRecord(raw);
+        return {
+          id: asString(profile.id),
+          name: asString(profile.name, "Unnamed profile"),
+          kind: profile.kind === "claude" ? "claude" : "local",
+          endpoint: asString(profile.endpoint) || undefined,
+          defaultModel: asString(
+            at(profile, "defaultModel", "default_model"),
+          ),
+          credentialRef:
+            asString(at(profile, "credentialRef", "credential_ref")) ||
+            undefined,
+          revision: asNumber(profile.revision, 1),
+          createdAt: asNumber(at(profile, "createdAt", "created_at")),
+          updatedAt: asNumber(at(profile, "updatedAt", "updated_at")),
+        };
+      })
+      .filter((profile) => profile.id && profile.defaultModel),
+  };
+}
+
+function normalizeJobStatus(value: unknown): JobStatus {
+  return value === "draft" ||
+    value === "ready" ||
+    value === "planning" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "cancelled" ||
+    value === "interrupted"
+    ? value
+    : "blocked";
+}
+
+function normalizeJobProvider(value: unknown): JobProviderSnapshot | undefined {
+  const provider = asRecord(value);
+  const profileId = asString(at(provider, "profileId", "profile_id"));
+  const model = asString(provider.model);
+  if (!profileId || !model) return undefined;
+  return {
+    profileId,
+    profileRevision: asNumber(
+      at(provider, "profileRevision", "profile_revision"),
+      1,
+    ),
+    profileName: asString(
+      at(provider, "profileName", "profile_name"),
+      "Unknown profile",
+    ),
+    kind: provider.kind === "claude" ? "claude" : "local",
+    endpoint: asString(provider.endpoint) || undefined,
+    model,
+  };
+}
+
+export function normalizeJobStore(value: unknown): JobStore {
+  const store = asRecord(value);
+  return {
+    version: asNumber(store.version, 1),
+    jobs: asArray(store.jobs)
+      .map((raw): JobRecord => {
+        const job = asRecord(raw);
+        return {
+          id: asString(job.id),
+          projectId: asString(at(job, "projectId", "project_id")),
+          projectName: asString(
+            at(job, "projectName", "project_name"),
+            "Unknown project",
+          ),
+          canonicalRepository: asString(
+            at(job, "canonicalRepository", "canonical_repository"),
+          ),
+          skillId: asString(at(job, "skillId", "skill_id")),
+          skillName: asString(
+            at(job, "skillName", "skill_name"),
+            "Unknown skill",
+          ),
+          skillDigest: asString(at(job, "skillDigest", "skill_digest")),
+          skillRoot: asString(at(job, "skillRoot", "skill_root")),
+          provider: normalizeJobProvider(job.provider),
+          runMode: job.runMode === "apply" ? "apply" : "plan",
+          approvalMode:
+            job.approvalMode === "continuous" ? "continuous" : "guided",
+          maxTurns: asNumber(at(job, "maxTurns", "max_turns"), 10),
+          status: normalizeJobStatus(job.status),
+          currentStage: asString(
+            at(job, "currentStage", "current_stage"),
+            "unknown",
+          ),
+          preflightId:
+            asString(at(job, "preflightId", "preflight_id")) || undefined,
+          activeRunId:
+            asString(at(job, "activeRunId", "active_run_id")) || undefined,
+          attempts: asArray(job.attempts)
+            .map((rawAttempt): JobAttempt => {
+              const attempt = asRecord(rawAttempt);
+              return {
+                runId: asString(at(attempt, "runId", "run_id")),
+                startedAt: asNumber(at(attempt, "startedAt", "started_at")),
+                finishedAt:
+                  asNumber(at(attempt, "finishedAt", "finished_at")) ||
+                  undefined,
+                outcome: attempt.outcome
+                  ? normalizeJobStatus(attempt.outcome)
+                  : undefined,
+              };
+            })
+            .filter((attempt) => attempt.runId),
+          resultPath:
+            asString(at(job, "resultPath", "result_path")) || undefined,
+          artifactPaths: asArray(
+            at(job, "artifactPaths", "artifact_paths"),
+          ).filter((path): path is string => typeof path === "string"),
+          lastError:
+            asString(at(job, "lastError", "last_error")) || undefined,
+          createdAt: asNumber(at(job, "createdAt", "created_at")),
+          updatedAt: asNumber(at(job, "updatedAt", "updated_at")),
+        };
+      })
+      .filter((job) => job.id && job.projectId && job.skillId),
+  };
 }
 
 function normalizeSeverity(value: unknown): IssueSeverity {
