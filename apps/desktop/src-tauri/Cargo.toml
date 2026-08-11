@@ -1,0 +1,21 @@
+[package]
+name = "pimp-code-desktop"
+version = "0.0.0"
+description = "Tauri feasibility spike for Pimp Code"
+authors = ["Pimp Code contributors"]
+edition = "2024"
+
+[lib]
+name = "pimp_code_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }

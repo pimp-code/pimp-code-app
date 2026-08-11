@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+*.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/target/

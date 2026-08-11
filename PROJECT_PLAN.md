@@ -1,6 +1,6 @@
 # Pimp Code App — Product and Implementation Plan
 
-Status: discovery draft, 11 August 2026
+Status: implementation in progress, updated 11 August 2026
 
 ## Recommended product direction
 
@@ -44,7 +44,7 @@ Do not lead with a single “code quality score.” The sibling TypeScript proto
 
 ## Repository findings that shape the plan
 
-The target directory is empty, so this is a greenfield UI and integration project. There are two useful sibling prototypes, but neither is the finished engine for this product.
+The project started as a greenfield UI and integration repository. It now contains a working Tauri 2 feasibility spike with a React renderer, a Rust-owned child-process boundary, a TypeScript agent host, a Claude runtime path, and a loopback-only OpenAI-compatible bridge. The two sibling prototypes remain useful references, but neither is the finished engine for this product.
 
 | Existing asset                 | Reuse                                                                                                                        | Do not inherit unchanged                                                                                                                                |
 | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -131,42 +131,45 @@ The user applies an approved patch to the original worktree, exports it, or disc
 
 ## Application architecture
 
-Electron is the recommended MVP shell because the reusable engine is Node/TypeScript and the product needs local filesystem, process, and Git access. Keep the engine in a separate process with a versioned protocol so a localhost web client, CLI, or different desktop shell can be added later.
+Tauri 2 is the selected MVP shell. The Rust core owns the trusted desktop boundary, narrow typed commands, native dialogs, resource resolution, and child-process supervision. The Node/TypeScript job engine remains a separate packaged sidecar behind a versioned JSONL protocol so the renderer never receives filesystem, process, Git, environment, or credential access. This boundary also keeps a future CLI or alternate desktop shell possible.
 
 ```mermaid
 flowchart LR
-  UI["React renderer"] --> Bridge["Typed preload bridge"]
-  Bridge --> Main["Electron main process"]
-  Main --> Engine["Local job-engine process"]
+  UI["React/Vite WebView"] -->|"typed commands/events"| Core["Tauri 2 Rust core"]
+  Core --> Supervisor["Sidecar lifecycle supervisor"]
+  Supervisor --> Engine["Packaged Node job engine"]
   Engine --> Policy["Policy and approval engine"]
   Engine --> Skills["Skill catalog and runtime"]
   Engine --> Context["Repository scanner and context builder"]
+  Engine --> Runtimes["Agent runtime adapters"]
   Engine --> Providers["Provider adapters"]
   Engine --> Workspace["Isolated workspace and patch engine"]
   Engine --> Verify["Sandboxed verifier"]
   Engine --> Store["Append-only run artifact store"]
-  Providers --> Cloud["OpenAI / Claude / Gemini"]
-  Providers --> Local["LM Studio / Ollama / compatible endpoints"]
+  Runtimes --> ClaudeCode["Claude Code runtime"]
+  ClaudeCode --> Claude["Claude provider"]
+  ClaudeCode --> Compat["Local compatibility bridge"]
+  Providers --> Direct["Direct OpenAI / Gemini / LM Studio / Ollama / compatible"]
 ```
 
 Renderer security invariants:
 
-- `nodeIntegration: false`, context isolation and renderer sandbox enabled;
-- local packaged content only, restrictive CSP, no raw remote HTML;
-- narrow request/response IPC methods rather than exposing `ipcRenderer`;
-- validate IPC sender and every argument in the main process;
+- no Node runtime, raw Tauri internals, filesystem API, or process API exposed to the renderer;
+- local packaged content only, restrictive CSP, no raw remote HTML, and no navigation to untrusted origins;
+- allowlisted Tauri commands/events with the smallest capability set per window;
+- release sidecars resolved from integrity-checked packaged resources, never ambient `PATH` or workspace paths;
+- validate every command argument and re-resolve every path in the Rust core and engine;
 - render model/skill Markdown as untrusted, sanitized content;
 - API keys, filesystem APIs, process handles, and raw environment variables never enter renderer state.
 
-This follows Electron's current [security checklist](https://www.electronjs.org/docs/latest/tutorial/security), including context isolation, sandboxing, restrictive IPC, and navigation controls.
+The Tauri capability manifest, CSP, command surface, updater configuration, and bundled sidecars are release-gated security configuration. Tauri reduces the renderer's ambient authority but does not make the engine, provider traffic, or child processes a sandbox.
 
 ### Suggested monorepo shape
 
 ```text
 pimp-code-app/
   apps/
-    desktop/              Electron main, preload, packaging
-    renderer/             React/Vite UI
+    desktop/              Tauri Rust core, capabilities, packaging, React/Vite UI
   packages/
     protocol/             Versioned commands, events, schemas
     engine/               Job state machine and orchestration
@@ -186,7 +189,7 @@ pimp-code-app/
     test-fixtures/        Representative frontend repositories
 ```
 
-Use a pnpm workspace and strict TypeScript. Keep domain schemas in `protocol` and validate all process/provider boundaries at runtime. Use append-only JSONL events plus immutable JSON/Markdown/diff artifacts for the MVP, backed by atomic checkpoints, operation IDs, and idempotency records; add SQLite only when history querying genuinely requires it.
+Use an npm workspace and strict TypeScript. Keep domain schemas in `protocol` and validate all renderer/Rust/engine/provider boundaries at runtime. Use append-only JSONL events plus immutable JSON/Markdown/diff artifacts for the MVP, backed by atomic checkpoints, operation IDs, and idempotency records; add SQLite only when history querying genuinely requires it.
 
 ## Job engine and durable run protocol
 
@@ -299,6 +302,22 @@ The official-document broker accepts only engine-selected domains from a version
 
 Do not build one OpenAI-shaped client and route every endpoint through it. Normalize only what the engine truly needs, and preserve provider-specific semantics behind adapters.
 
+Claude Code is one constrained runtime adapter for the Claude provider, not the universal execution backend. Its bundled tools remain restricted by the engine's approved context and read-only policy. The spike's Anthropic-to-OpenAI compatibility bridge is retained only as an explicitly labelled bridge for early loopback local-model testing; it must not define the common provider contract or be presented as native LM Studio/Ollama support. Direct OpenAI, Gemini, LM Studio, Ollama, and generic OpenAI-compatible adapters are added behind the common contract as separate implementations.
+
+Keep the runtime and provider concepts distinct:
+
+```ts
+interface RuntimeAdapter {
+  id: string;
+  supportedProviders: string[];
+  healthCheck(profile: ProviderProfile): Promise<RuntimeHealth>;
+  listModels?(profile: ProviderProfile): Promise<ModelDescriptor[]>;
+  startPlan(request: PlanRunRequest): Promise<GenerationHandle>;
+}
+```
+
+The initial `claude-code` runtime supports the Claude profile and the explicitly named local compatibility profile. Direct provider adapters implement the lower-level `ProviderAdapter` contract below and leave repository reads, tool loops, permissions, turn limits, retries, and skill execution to the engine.
+
 ```ts
 type Support = "supported" | "unsupported" | "unknown";
 type CancellationKind =
@@ -365,7 +384,7 @@ interface ProviderAdapter {
 }
 ```
 
-Each adapter performs one model turn. The engine owns the tool loop, permissions, retries, and skill execution; provider SDK auto-tool execution stays disabled. Resolve a capability snapshot for the exact profile, base URL/deployment, protocol, model ID, and execution mode. Model listing is optional.
+Each direct provider adapter performs one model turn. The engine owns the tool loop, permissions, retries, and skill execution; provider SDK auto-tool execution stays disabled. A higher-level runtime adapter such as Claude Code may own an internal bounded tool loop only when the engine supplies an allowlisted tool set, canonical scope, configured turn limit, and normalized audit events. Resolve a capability snapshot for the exact runtime, profile, base URL/deployment, protocol, model ID, and execution mode. Model listing is optional.
 
 Normalized events should include `status`, `text_delta`, `tool_call_delta`, `tool_call`, `usage`, `completed`, and `error`. Every tool event carries the original stable call ID, name, sequence/index, argument fragment, and final locally validated arguments so parallel/interleaved calls remain correlated. A terminal event maps to `FinishOutcome` and retains the raw provider reason; a successful HTTP response is not success when output is refused, truncated, safety-stopped, or invalid.
 
@@ -379,12 +398,15 @@ Capabilities belong primarily to the selected model, endpoint, and deployment—
 
 | Adapter            | Recommended integration                                                                                               | Important behavior                                                                                                                           |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code runtime | Official Claude Agent SDK with its packaged Claude Code binary                                                       | Claude-only runtime adapter for the first cloud path; bounded read-only tools, turns, diagnostics, and explicit egress approval               |
 | OpenAI             | Official SDK and Responses API                                                                                        | Streaming, strict function schemas, structured final output, usage, and model-specific capabilities; hosted Skills excluded from MVP         |
-| Anthropic/Claude   | Official SDK and Messages API                                                                                         | Top-level system instructions, content-block tools/results, and different stop reasons; streamed tool JSON must be accumulated and validated |
+| Anthropic direct (optional later) | Official SDK and Messages API                                                                            | Not required for the first Claude path; if added, preserve top-level system instructions, content blocks, and native stop reasons             |
 | Google Gemini      | Official `@google/genai` SDK; Interactions preferred with `generateContent` fallback                                  | Function calls, structured output, thought signatures, and client-only abort semantics need native handling                                  |
 | LM Studio          | Native v1 API for reachability/model management; `/v1/responses` or `/v1/chat/completions` for custom tool generation | Native `/api/v1/chat` does not provide arbitrary custom tools; local model/tool quality still varies                                         |
 | Ollama             | Native API/SDK, one client instance per active stream/handle                                                          | Native streaming is NDJSON; `abort()` affects all streams owned by that client, and capabilities vary by model                               |
 | Generic compatible | Configurable base URL and headers with capability probes                                                              | Best-effort subset; never assume `/models`, Responses, tools, JSON schema, or cancellation all work                                          |
+
+The temporary Claude Code compatibility bridge to loopback OpenAI Chat Completions endpoints is intentionally absent from the direct-adapter table: it is a migration aid with a narrower compatibility promise, not the target abstraction.
 
 Official capability references: [OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling), [OpenAI Skills and tool workflows](https://developers.openai.com/api/docs/guides/tools-skills), [Claude streaming](https://platform.claude.com/docs/en/build-with-claude/streaming), [Gemini function calling](https://ai.google.dev/gemini-api/docs/function-calling), [Ollama streaming](https://docs.ollama.com/api/streaming), [Ollama structured outputs](https://docs.ollama.com/capabilities/structured-outputs), and [LM Studio API comparison](https://lmstudio.ai/docs/developer/rest).
 
@@ -415,7 +437,7 @@ Treat the target repository, skill files, model output, and provider stream as f
 - Apply secret detection/redaction to context, model streams, tool arguments, provider errors, reports, diffs, screenshots, clipboard/export, crash logs, and command output. Persist sanitized normalized provider data by default, not raw responses.
 - Recheck real path and starting content hash immediately before every write.
 - Deny outside-root and device/special paths on every platform.
-- Never render or navigate the target application inside a privileged Electron view. Browser/visual checks use a disposable, unprivileged browser process and profile with an explicit network policy.
+- Never render or navigate the target application inside the privileged Tauri application webview. Browser/visual checks use a disposable, unprivileged browser process and profile with an explicit network policy.
 
 ### Isolated mutation
 
@@ -444,7 +466,7 @@ interface ApprovedCommand {
 
 Do not accept shell command strings. Resolve the executable absolutely, verify its digest, and synthesize a minimal environment rather than inheriting `PATH`, proxy settings, credential helpers, or tokens. Package-manager scripts often invoke a shell internally, so preview and hash the expanded `package.json` script; migrate the prototypes' string check guards into this contract.
 
-Phase 0 must select and prove a Windows containment mechanism with resource limits, network control, bounded/redacted output, and whole-process-tree termination. Worktrees and Electron child processes are not sandboxes. Block project commands when the promised containment cannot be enforced. Package installs are high impact; default to disabled lifecycle scripts, and require a separate approval plus sandbox/network policy to enable them.
+Phase 0 must select and prove a Windows containment mechanism with resource limits, network control, bounded/redacted output, and whole-process-tree termination. Worktrees and Tauri-managed sidecars are not sandboxes. Block project commands when the promised containment cannot be enforced. Package installs are high impact; default to disabled lifecycle scripts, and require a separate approval plus sandbox/network policy to enable them.
 
 ## Frontend product surfaces
 
@@ -477,28 +499,30 @@ Deliverables:
 - decide desktop/platform, Git/dirty-repo, artifact, and permission policies;
 - stabilize and test the sibling TypeScript prototype;
 - mark reusable modules and security fixes before extraction;
-- pin an Electron/Node combination compatible with the prototype's Node 22.18+ requirement, or package a separate engine runtime;
+- package pinned Windows Node, agent-host, and Claude Code binaries as Tauri sidecars/resources with build-time hashes, licenses, and a reproducible preparation step; never resolve them from the workspace or system `PATH` in a release;
+- add runtime/provider health checks, model discovery where available, user-configurable bounded turn limits, and sanitized actionable diagnostics;
 - prototype Windows command/process/network containment and block command-enabled scope if it cannot meet policy;
 - migrate legacy string check guards conceptually into the structured command contract;
 - commit/version and bundle the intended first-party skills independently of the development-only `../skills` path;
 - co-locate the rescue `agents/openai.yaml` with its `SKILL.md` or deliberately flatten that package;
 - define protocol schemas, run states, capabilities, and threat model.
 
-Exit: one approved architecture decision record and reproducible source inputs.
+Exit: one approved architecture decision record and reproducible source inputs; the packaged app launches on a second Windows machine without system Node or the development workspace and completes one Claude and one local read-only smoke run.
 
 ### Phase 1 — Read-only vertical slice
 
 Deliverables:
 
-- pnpm monorepo, Electron shell, React renderer, typed IPC, engine child process;
+- npm monorepo, Tauri 2 shell, React/Vite renderer, typed commands/events, packaged engine sidecar;
 - exact repository/workspace picker and safe metadata scan;
 - recursive Agent Skill discovery, validation, hashing, catalog UI;
 - app-owned immutable run storage and timeline;
-- one cloud adapter (OpenAI) and one local adapter (LM Studio) behind the final contract;
-- context/egress preview and a clearly labelled plan-only rescue readiness/recovery plan;
+- Claude Code as the first Claude runtime adapter plus the explicitly labelled loopback compatibility bridge for the first local-model path;
+- provider/runtime health checks, available model discovery where supported, and configurable bounded turn limits;
+- context/egress preview and a clearly labelled `migrate-to-vite` plan-only workflow with structured Markdown and JSON output;
 - cancellation, timeout, crash recovery, and schema-validation paths.
 
-Exit: the same fixture repository and plan-only skill mode produce valid audited plans through one cloud and one local model with zero target writes or project processes. Full `rescue-the-project` diagnosis remains uncertified until guarded commands exist.
+Exit: the same fixture repository and `migrate-to-vite` plan-only skill mode produce valid audited plans through Claude and one local model with zero target writes or project processes. Full migration Apply and `rescue-the-project` diagnosis remain uncertified until guarded writes and commands exist.
 
 ### Phase 2 — Guarded patch vertical slice
 
@@ -518,7 +542,8 @@ Exit: an approved migration changes only expected files, passes declared checks,
 
 Deliverables:
 
-- Claude, Gemini, Ollama, and generic OpenAI-compatible adapters;
+- direct OpenAI and Gemini adapters, native LM Studio and Ollama profiles, and a generic OpenAI-compatible adapter;
+- migration away from the Claude Code compatibility bridge for providers with a direct adapter, while retaining Claude Code for the Claude runtime;
 - model discovery where available, connection tests, capability tri-state and compatibility UI;
 - normalized event/usage/error handling and accurate cancellation labels;
 - per-run budgets and explicit fallback-as-clone flow;
@@ -542,7 +567,7 @@ Exit: each visible “Apply” button corresponds to a tested, declared capabili
 
 Deliverables:
 
-- Windows installer/update/signing strategy and secure Electron fuses;
+- Windows installer/update/signing strategy, minimal Tauri capabilities, sidecar integrity checks, and hardened production CSP;
 - full accessibility and keyboard pass;
 - storage retention/cleanup, secret redaction, and corrupted-run recovery;
 - performance for large repositories and monorepos;
@@ -560,7 +585,7 @@ Exit: beta acceptance criteria below pass on representative real projects.
 - Provider contract tests from recorded official-protocol fixtures: text, tools, usage, malformed JSON, rate limits, cancellation, timeout, and partial streams.
 - Release-gated live smoke tests for each supported provider/protocol and certified exact model version; recorded fixtures alone cannot detect API drift.
 - Integration tests with fixture repositories for clean, dirty, non-Git, monorepo, symlink, Windows junction/reparse/UNC/device-path, malicious Git filter/hook, secret, huge-file, and changing-file cases.
-- Electron end-to-end tests for project selection, approvals, cancellation, resume, diff review, and publish conflicts.
+- Tauri end-to-end tests for project selection, approvals, cancellation, resume, diff review, and publish conflicts.
 - Security tests for malicious repository text, malicious skill text/YAML, path escapes, Markdown XSS, executable config, command/script substitution, secret leakage through every artifact/export path, and uncertain side-effect recovery.
 
 ### Outcome evals
@@ -669,7 +694,7 @@ Answer these before Phase 1. They materially change the architecture or product 
 If the goal is to reach a trustworthy beta quickly, use these defaults:
 
 - both meanings of frontend: React desktop UI plus frontend-repository focus;
-- Windows-first Electron app;
+- Windows-first Tauri 2 app with packaged runtimes;
 - solo developer first, BYOK credentials;
 - per-repository remote egress consent plus per-run context preview;
 - bundled, reviewed, hash-pinned first-party skills only;
@@ -683,6 +708,10 @@ If the goal is to reach a trustworthy beta quickly, use these defaults:
 - provider parity means common workflow/safety artifacts, not identical output;
 - stop after failed verification and ask the user before any repair iteration.
 
-## Immediate next decision
+## Immediate implementation sequence
 
-Resolve questions 1, 2, 8, 10, 11, 14, and 15 first. Once those are answered, Phase 0 can be converted into a file-level implementation backlog without guessing at the trust boundary.
+1. Commit the verified Tauri feasibility spike and this architecture update.
+2. Replace workspace/system runtime lookup with reproducibly prepared Tauri sidecars and pass the two-machine smoke gate.
+3. Implement the recursive `../skills/**/SKILL.md` catalog, including malformed/orphaned metadata visibility, package digests, and configurable roots.
+4. Build the `migrate-to-vite` read-only vertical slice: canonical repository confirmation, applicability and file-context preview, explicit Claude egress approval, structured plan output, and app-owned Markdown/JSON artifacts.
+5. Add durable state-machine history before enabling any target write or project command.
