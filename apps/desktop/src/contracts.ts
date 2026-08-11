@@ -47,6 +47,7 @@ export interface SkillCatalogEntry {
   packageRoot: string;
   manifestPath: string;
   status: CatalogEntryStatus;
+  planningSupported: boolean;
   name?: string;
   description?: string;
   digest: string;
@@ -295,6 +296,9 @@ function normalizeCatalogEntry(
     packageRoot: asString(at(entry, "packageRoot", "package_root")),
     manifestPath: asString(at(entry, "manifestPath", "manifest_path")),
     status,
+    planningSupported: asBoolean(
+      at(entry, "planningSupported", "planning_supported"),
+    ),
     name: asString(entry.name) || undefined,
     description: asString(entry.description) || undefined,
     digest: asString(entry.digest),

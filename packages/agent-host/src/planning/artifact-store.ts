@@ -2,14 +2,17 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import {
-  renderMigrateToVitePlanMarkdown,
-  validateMigrateToVitePlanV1,
   type MigrateToVitePlanV1,
 } from "./migrate-to-vite-plan.js";
 import {
-  assertMigrateToVitePreflightIntegrity,
   type MigrateToVitePreflight,
 } from "./preflight.js";
+import {
+  assertPlanningPreflightIntegrity,
+  getPlanningAdapter,
+  type PlanningPlan,
+  type PlanningPreflight,
+} from "./planning-adapter.js";
 import { pathIsWithin } from "./repository-context.js";
 import { sha256, stableJson } from "./stable-json.js";
 
@@ -101,11 +104,11 @@ async function writeImmutable(
 }
 
 export async function writePlanningRunMetadata(options: {
-  preflight: MigrateToVitePreflight;
+  preflight: PlanningPreflight;
   runDirectory: string;
   metadata: Record<string, unknown>;
 }): Promise<PlanningArtifactFile> {
-  assertMigrateToVitePreflightIntegrity(options.preflight);
+  assertPlanningPreflightIntegrity(options.preflight);
   const outputRoot = await realpath(options.preflight.repository.outputRoot);
   if (!samePath(outputRoot, options.preflight.repository.outputRoot)) {
     throw new Error("Output root changed after preflight");
@@ -123,8 +126,16 @@ export async function writeMigrateToVitePlanArtifacts(options: {
   plan: MigrateToVitePlanV1;
   runId: string;
 }): Promise<PlanningArtifactPaths> {
+  return writePlanningPlanArtifacts(options);
+}
+
+export async function writePlanningPlanArtifacts(options: {
+  preflight: PlanningPreflight;
+  plan: PlanningPlan;
+  runId: string;
+}): Promise<PlanningArtifactPaths> {
   assertRunId(options.runId);
-  assertMigrateToVitePreflightIntegrity(options.preflight);
+  assertPlanningPreflightIntegrity(options.preflight);
   const outputMetadata = await lstat(options.preflight.repository.outputRoot);
   if (outputMetadata.isSymbolicLink() || !outputMetadata.isDirectory()) {
     throw new Error("Output root changed or became a symlink after preflight");
@@ -157,8 +168,9 @@ export async function writeMigrateToVitePlanArtifacts(options: {
   ) {
     throw new Error("Run artifact path escapes the output root");
   }
-  const plan = validateMigrateToVitePlanV1(options.plan, options.preflight);
-  const markdown = renderMigrateToVitePlanMarkdown(plan, options.preflight);
+  const adapter = getPlanningAdapter(options.preflight);
+  const plan = adapter.validate(options.plan);
+  const markdown = adapter.render(plan);
 
   await mkdir(runDirectory, { recursive: false, mode: 0o700 });
   const canonicalRunDirectory = await assertContainedRunDirectory(outputRoot, runDirectory);

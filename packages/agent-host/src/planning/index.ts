@@ -7,11 +7,13 @@ export {
   pathIsWithin,
   resolveRepositoryPreflight,
   selectMigrateToViteContext,
+  selectUpgradeReactRouterToV8Context,
   type ContextExclusionReason,
   type ContextInclusionReason,
   type ContextManifestExclusion,
   type ContextManifestFile,
   type ContextSelectionLimits,
+  type PlanningContextProfile,
   type RepositoryContextBundle,
   type RepositoryContextDocument,
   type RepositoryContextManifest,
@@ -25,12 +27,24 @@ export {
   type ViteApplicabilityStatus,
 } from "./vite-applicability.js";
 export {
+  detectReactRouterV8Applicability,
+  type ReactRouterApplicability,
+  type ReactRouterApplicabilityStatus,
+  type ReactRouterEvidence,
+  type ReactRouterEvidenceKind,
+  type ReactRouterVersionEvidence,
+} from "./router-applicability.js";
+export {
   MIGRATE_TO_VITE_PREFLIGHT_SCHEMA_VERSION,
+  UPGRADE_REACT_ROUTER_TO_V8_PREFLIGHT_SCHEMA_VERSION,
   assertMigrateToVitePreflightIntegrity,
+  assertUpgradeReactRouterToV8PreflightIntegrity,
   prepareMigrateToVitePreflight,
+  prepareUpgradeReactRouterToV8Preflight,
   type MigrateToVitePreflight,
   type SelectedSkillInput,
   type SelectedSkillSnapshot,
+  type UpgradeReactRouterToV8Preflight,
 } from "./preflight.js";
 export {
   MIGRATE_TO_VITE_PLAN_SCHEMA_VERSION,
@@ -54,7 +68,34 @@ export {
   type ScriptChange,
 } from "./migrate-to-vite-plan.js";
 export {
+  UPGRADE_REACT_ROUTER_TO_V8_PLAN_SCHEMA_VERSION,
+  UPGRADE_REACT_ROUTER_TO_V8_PLAN_V1_SCHEMA,
+  buildUpgradeReactRouterToV8PlanPrompt,
+  parseUpgradeReactRouterToV8PlanV1,
+  renderUpgradeReactRouterToV8PlanMarkdown,
+  validateUpgradeReactRouterToV8PlanV1,
+  type RouterMigrationStep,
+  type RouterPlanAction,
+  type RouterPlannedVerification,
+  type RouteParityEntry,
+  type UpgradeReactRouterToV8PlanV1,
+} from "./upgrade-react-router-to-v8-plan.js";
+export {
+  CERTIFIED_PLANNING_ADAPTERS,
+  SUPPORTED_PLANNING_SKILL_NAMES,
+  assertCertifiedPlanningSkillIdentity,
+  assertPlanningPreflightIntegrity,
+  getPlanningAdapter,
+  isCertifiedPlanningSkillIdentity,
+  isPlanningSkillSupported,
+  type BoundPlanningAdapter,
+  type PlanningPlan,
+  type PlanningPreflight,
+  type PlanningSkillName,
+} from "./planning-adapter.js";
+export {
   writePlanningRunMetadata,
+  writePlanningPlanArtifacts,
   writeMigrateToVitePlanArtifacts,
   type PlanningArtifactFile,
   type PlanningArtifactPaths,

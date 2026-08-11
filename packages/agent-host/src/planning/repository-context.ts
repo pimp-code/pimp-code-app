@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
-import { hashStableJson, sha256 } from "./stable-json.js";
+import { hashStableJson, sha256, stableJson } from "./stable-json.js";
 
 export const REPOSITORY_PREFLIGHT_SCHEMA_VERSION = "repository-preflight/v1";
 export const CONTEXT_MANIFEST_SCHEMA_VERSION = "repository-context-manifest/v1";
@@ -28,12 +28,18 @@ export type ContextInclusionReason =
   | "legacy-build-config"
   | "package-manager-lockfile"
   | "package-manifest"
+  | "router-source"
   | "source-entry"
+  | "test-source"
   | "test-config"
   | "tooling-config"
   | "typescript-config"
   | "vite-config"
   | "workspace-config";
+
+export type PlanningContextProfile =
+  | "migrate-to-vite"
+  | "upgrade-react-router-to-v8";
 
 export type ContextExclusionReason =
   | "binary-file"
@@ -44,6 +50,7 @@ export type ContextExclusionReason =
   | "invalid-utf8"
   | "outside-repository"
   | "path-denylist"
+  | "router-signal-scan-limit"
   | "secret-path-denylist"
   | "special-file"
   | "suspected-secret-content"
@@ -66,7 +73,7 @@ export interface ContextManifestFile {
   sourceSha256: string;
   contextBytes: number;
   contextSha256: string;
-  contentKind: "text" | "environment-variable-names";
+  contentKind: "text" | "environment-variable-names" | "lockfile-summary";
 }
 
 export interface ContextManifestExclusion {
@@ -88,7 +95,7 @@ export interface RepositoryContextManifest {
 export interface RepositoryContextDocument {
   relativePath: string;
   reason: ContextInclusionReason;
-  contentKind: "text" | "environment-variable-names";
+  contentKind: "text" | "environment-variable-names" | "lockfile-summary";
   content: string;
   contextSha256: string;
 }
@@ -298,7 +305,10 @@ function isSecretPath(relativePath: string): boolean {
     .some(isSecretPathSegment);
 }
 
-function inclusionReason(relativePath: string): ContextInclusionReason | undefined {
+function inclusionReason(
+  relativePath: string,
+  profile: PlanningContextProfile,
+): ContextInclusionReason | undefined {
   const lowerPath = relativePath.toLowerCase();
   const name = basename(lowerPath);
 
@@ -344,6 +354,21 @@ function inclusionReason(relativePath: string): ContextInclusionReason | undefin
     return "source-entry";
   }
   if (
+    profile === "upgrade-react-router-to-v8" &&
+    /(?:^|\/)(?:src|app|tests?|__tests__)\//u.test(lowerPath) &&
+    /(?:\.test|\.spec)\.[cm]?[jt]sx?$/u.test(name)
+  ) {
+    return "test-source";
+  }
+  if (
+    profile === "upgrade-react-router-to-v8" &&
+    /(?:^|\/)(?:src|app|pages?|routes?|tests?|__tests__)\//u.test(lowerPath) &&
+    /(?:^|\/)(?:router|routes?|routing|navigation|history)(?:[./_-]|$)/u.test(lowerPath) &&
+    /\.[cm]?[jt]sx?$/u.test(name)
+  ) {
+    return "router-source";
+  }
+  if (
     lowerPath.startsWith(".github/workflows/") &&
     /\.ya?ml$/u.test(lowerPath)
   ) {
@@ -358,6 +383,76 @@ function inclusionReason(relativePath: string): ContextInclusionReason | undefin
     return "deployment-config";
   }
   return undefined;
+}
+
+function isRouterSignalCandidate(relativePath: string): boolean {
+  const lowerPath = relativePath.toLowerCase();
+  return (
+    /(?:^|\/)(?:src|app|pages?|features?|components?)\//u.test(lowerPath) &&
+    /\.[cm]?[jt]sx?$/u.test(lowerPath) &&
+    !/\.d\.[cm]?ts$/u.test(lowerPath)
+  );
+}
+
+function containsRouterSourceSignal(content: string): boolean {
+  return (
+    /\b(?:from\s+|require\s*\(\s*)["']react-router(?:-dom)?["']/u.test(content) ||
+    /\b(?:createBrowserRouter|createHashRouter|RouterProvider|useRoutes)\b/u.test(content) ||
+    /<(?:BrowserRouter|HashRouter|MemoryRouter|Route|Routes)\b/u.test(content)
+  );
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function routerLockfileSummary(relativePath: string, content: string): string {
+  const lowerPath = relativePath.toLowerCase();
+  const routerPackages = ["react-router", "react-router-dom"] as const;
+  const entries: Array<{
+    packageName: (typeof routerPackages)[number];
+    directSpecifier: string | null;
+    resolvedVersion: string | null;
+  }> = [];
+  if (lowerPath.endsWith("package-lock.json") || lowerPath.endsWith("npm-shrinkwrap.json")) {
+    try {
+      const lock = objectRecord(JSON.parse(content) as unknown);
+      const packages = objectRecord(lock?.packages);
+      const root = objectRecord(packages?.[""]);
+      const v1Dependencies = objectRecord(lock?.dependencies);
+      for (const packageName of routerPackages) {
+        let directSpecifier: string | null = null;
+        for (const sectionName of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+          const section = objectRecord(root?.[sectionName]);
+          if (typeof section?.[packageName] === "string") {
+            directSpecifier = section[packageName] as string;
+            break;
+          }
+        }
+        const installed = objectRecord(packages?.[`node_modules/${packageName}`]);
+        const v1 = objectRecord(v1Dependencies?.[packageName]);
+        const resolved = installed?.version ?? v1?.version;
+        const resolvedVersion = typeof resolved === "string" ? resolved : null;
+        if (directSpecifier !== null || resolvedVersion !== null) {
+          entries.push({ packageName, directSpecifier, resolvedVersion });
+        }
+      }
+      return `${stableJson({ format: "npm", lockfileVersion: lock?.lockfileVersion ?? null, routerPackages: entries }, 2)}\n`;
+    } catch {
+      return `${stableJson({ format: "npm", malformed: true, routerPackages: [] }, 2)}\n`;
+    }
+  }
+
+  for (const packageName of routerPackages) {
+    const escaped = packageName.replace("-", "\\-");
+    const resolvedMatch = new RegExp(`${escaped}(?:@|[/\\s:'\"])+(?:npm:)?[~^<>=v]*(\\d+(?:\\.\\d+){0,2})`, "iu").exec(content);
+    if (resolvedMatch?.[1]) {
+      entries.push({ packageName, directSpecifier: null, resolvedVersion: resolvedMatch[1] });
+    }
+  }
+  return `${stableJson({ format: "other", routerPackages: entries }, 2)}\n`;
 }
 
 function extractEnvironmentNames(content: string): string[] {
@@ -493,8 +588,9 @@ async function readRegularFileSnapshot(
   }
 }
 
-export async function selectMigrateToViteContext(
+async function selectRepositoryContext(
   preflight: RepositoryPreflight,
+  profile: PlanningContextProfile,
   limitOverrides?: Partial<ContextSelectionLimits>,
 ): Promise<RepositoryContextBundle> {
   const rootMetadata = await lstat(preflight.repositoryRoot);
@@ -512,6 +608,7 @@ export async function selectMigrateToViteContext(
   const environmentVariableNames = new Set<string>();
   let scannedPathCount = 0;
   let totalContextBytes = 0;
+  let routerSignalCandidateCount = 0;
 
   const exclude = (relativePath: string, reason: ContextExclusionReason): void => {
     excluded.push({ relativePath, reason });
@@ -571,8 +668,19 @@ export async function selectMigrateToViteContext(
         continue;
       }
 
-      const reason = inclusionReason(relativePath);
-      if (!reason) continue;
+      let reason = inclusionReason(relativePath, profile);
+      const routerSignalCandidate =
+        reason === undefined &&
+        profile === "upgrade-react-router-to-v8" &&
+        isRouterSignalCandidate(relativePath);
+      if (!reason && !routerSignalCandidate) continue;
+      if (routerSignalCandidate) {
+        routerSignalCandidateCount += 1;
+        if (routerSignalCandidateCount > limits.maxFiles * 4) {
+          exclude(relativePath, "router-signal-scan-limit");
+          continue;
+        }
+      }
       if (files.length >= limits.maxFiles) {
         exclude(relativePath, "file-count-limit");
         continue;
@@ -605,6 +713,11 @@ export async function selectMigrateToViteContext(
         exclude(relativePath, "invalid-utf8");
         continue;
       }
+      if (routerSignalCandidate) {
+        if (!containsRouterSourceSignal(sourceContent)) continue;
+        reason = "router-source";
+      }
+      if (!reason) throw new Error(`Context inclusion reason is unavailable: ${relativePath}`);
       let content = sourceContent;
       let contentKind: ContextManifestFile["contentKind"] = "text";
       if (reason === "environment-template-names") {
@@ -612,6 +725,12 @@ export async function selectMigrateToViteContext(
         for (const name of names) environmentVariableNames.add(name);
         content = names.join("\n") + (names.length > 0 ? "\n" : "");
         contentKind = "environment-variable-names";
+      } else if (
+        profile === "upgrade-react-router-to-v8" &&
+        reason === "package-manager-lockfile"
+      ) {
+        content = routerLockfileSummary(relativePath, sourceContent);
+        contentKind = "lockfile-summary";
       } else {
         for (const name of environmentNamesFromSource(sourceContent)) {
           environmentVariableNames.add(name);
@@ -671,4 +790,22 @@ export async function selectMigrateToViteContext(
     manifestSha256: hashStableJson(manifestWithoutHash),
   };
   return { manifest, documents };
+}
+
+export async function selectMigrateToViteContext(
+  preflight: RepositoryPreflight,
+  limitOverrides?: Partial<ContextSelectionLimits>,
+): Promise<RepositoryContextBundle> {
+  return selectRepositoryContext(preflight, "migrate-to-vite", limitOverrides);
+}
+
+export async function selectUpgradeReactRouterToV8Context(
+  preflight: RepositoryPreflight,
+  limitOverrides?: Partial<ContextSelectionLimits>,
+): Promise<RepositoryContextBundle> {
+  return selectRepositoryContext(
+    preflight,
+    "upgrade-react-router-to-v8",
+    limitOverrides,
+  );
 }

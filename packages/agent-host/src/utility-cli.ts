@@ -2,7 +2,14 @@ import { scanSkillCatalog } from "@pimp-code/skill-runtime";
 import { randomUUID } from "node:crypto";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { prepareMigrateToVitePreflight } from "./planning/index.js";
+import {
+  isCertifiedPlanningSkillIdentity,
+  isPlanningSkillSupported,
+  prepareMigrateToVitePreflight,
+  prepareUpgradeReactRouterToV8Preflight,
+  type PlanningPreflight,
+  type PlanningSkillName,
+} from "./planning/index.js";
 import { checkProviderHealth } from "./provider-health.js";
 import { validateProviderConfig } from "./validation.js";
 
@@ -70,6 +77,11 @@ async function catalogForUi(roots: string[]): Promise<unknown> {
     ...catalog,
     entries: catalog.entries.map((entry) => ({
       ...entry,
+      planningSupported:
+        entry.status === "valid" &&
+        typeof entry.name === "string" &&
+        typeof entry.digest === "string" &&
+        isCertifiedPlanningSkillIdentity(entry.name, entry.digest),
       rootPath: rootPaths.get(entry.rootId) ?? "",
       files: entry.files.map((file) => ({
         ...file,
@@ -85,8 +97,9 @@ async function catalogForUi(roots: string[]): Promise<unknown> {
   };
 }
 
-async function prepareVitePreflight(
+async function preparePlanningPreflight(
   request: Record<string, unknown>,
+  requiredSkillName?: PlanningSkillName,
 ): Promise<unknown> {
   const repository = requireString(request.repository, "repository");
   const skillId = requireString(request.skillId, "skillId", 200);
@@ -107,11 +120,16 @@ async function prepareVitePreflight(
   if (
     !entry ||
     entry.status !== "valid" ||
-    entry.name !== "migrate-to-vite" ||
+    !entry.name ||
+    !isPlanningSkillSupported(entry.name) ||
+    (requiredSkillName !== undefined && entry.name !== requiredSkillName) ||
     !entry.digest ||
     !entry.instructions
   ) {
-    throw new Error("The selected migrate-to-vite skill is not uniquely valid");
+    throw new Error("The selected skill is not uniquely valid or has no certified planning adapter");
+  }
+  if (!isCertifiedPlanningSkillIdentity(entry.name, entry.digest)) {
+    throw new Error("The selected skill package digest is not certified for planning");
   }
 
   const requestedRoot = resolve(
@@ -121,7 +139,7 @@ async function prepareVitePreflight(
   const id = randomUUID();
   const outputRoot = join(preflightRoot, id);
   await mkdir(outputRoot, { recursive: false });
-  const preflight = await prepareMigrateToVitePreflight({
+  const options = {
     repositoryPath: repository,
     outputRoot,
     skill: {
@@ -130,13 +148,29 @@ async function prepareVitePreflight(
       instructions: entry.instructions,
       ...(entry.manifestPath ? { manifestPath: entry.manifestPath } : {}),
     },
-    limits: {
-      maxDepth: 6,
-      maxFiles: 60,
-      maxFileBytes: 128 * 1024,
-      maxTotalBytes: 512 * 1024,
-    },
-  });
+    limits: entry.name === "upgrade-react-router-to-v8"
+      ? {
+          maxDepth: 6,
+          maxFiles: 100,
+          maxFileBytes: 512 * 1024,
+          maxTotalBytes: 2 * 1024 * 1024,
+        }
+      : {
+          maxDepth: 6,
+          maxFiles: 60,
+          maxFileBytes: 128 * 1024,
+          maxTotalBytes: 512 * 1024,
+        },
+  };
+  let preflight: PlanningPreflight;
+  switch (entry.name) {
+    case "migrate-to-vite":
+      preflight = await prepareMigrateToVitePreflight(options);
+      break;
+    case "upgrade-react-router-to-v8":
+      preflight = await prepareUpgradeReactRouterToV8Preflight(options);
+      break;
+  }
   const createdAt = new Date().toISOString();
   await writeFile(
     join(outputRoot, "preflight.json"),
@@ -228,7 +262,11 @@ async function dispatch(value: unknown): Promise<unknown> {
         validateProviderConfig(request.provider, { allowEmptyModel: true }),
       );
     case "prepare_migrate_to_vite":
-      return prepareVitePreflight(request);
+      return preparePlanningPreflight(request, "migrate-to-vite");
+    case "prepare_upgrade_react_router_to_v8":
+      return preparePlanningPreflight(request, "upgrade-react-router-to-v8");
+    case "prepare_plan":
+      return preparePlanningPreflight(request);
     default:
       throw new Error("Unknown utility operation");
   }

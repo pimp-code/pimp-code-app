@@ -11,7 +11,7 @@ This slice validates a local Tauri shell driving a packaged TypeScript engine an
 - Local compatibility profile using the same Claude Code binary through an in-process Anthropic Messages to OpenAI Chat Completions bridge. This is a transitional runtime adapter, not the universal backend or native LM Studio/Ollama support.
 - Loopback-only local endpoints.
 - Recursive `**/SKILL.md` catalog discovery with strict frontmatter/YAML validation, duplicate detection, package digests, inert scripts, orphan diagnostics, and configurable roots.
-- A dedicated `migrate-to-vite` plan-only workflow that snapshots an exact, bounded context manifest, redacts environment assignments, rejects secret paths, and revalidates repository and skill hashes immediately before a run.
+- Certified `migrate-to-vite` and `upgrade-react-router-to-v8` plan-only adapters that snapshot exact, bounded context manifests, redact environment assignments, reject secret paths, and revalidate repository and skill hashes immediately before a run.
 - Zero model tools in the plan-only workflow. The model receives only the approved immutable snapshot and its output must pass a strict structured-plan schema.
 - Explicit Claude context-egress approval, provider health/model discovery, and configurable 1-20 turn limits.
 - App-owned immutable Markdown, JSON, context, preflight, and run-metadata artifacts outside the selected repository.
@@ -22,6 +22,7 @@ This slice validates a local Tauri shell driving a packaged TypeScript engine an
 ## Intentional limitations
 
 - This is a plan-only vertical slice, not the controlled Apply executor described in `PROJECT_PLAN.md`.
+- Catalog validity does not authorize execution. Only skills exposed by the packaged planning-adapter registry are runnable.
 - The older low-level `start_agent` spike protocol still exists for regression coverage. The product UI uses `start_plan`, whose engine-owned snapshot and zero-tool policy are the supported boundary.
 - The bridge implements the protocol subset needed by the current test. It does not promise parity with Claude features such as thinking blocks, prompt caching, image blocks, or every tool-streaming edge case.
 - A local model must support the OpenAI Chat Completions API and should support tool calling. A successful connection does not prove that the model can follow long skills safely.
@@ -56,7 +57,7 @@ $env:ANTHROPIC_API_KEY = "your-api-key"
 npm.cmd run dev
 ```
 
-Select **Claude**, run the health check, use a model alias such as `sonnet`, choose a repository and the `migrate-to-vite` skill, approve the exact context, and start the plan. Do not put the API key into the UI or a repository file.
+Select **Claude**, run the health check, use a model alias such as `sonnet`, choose a repository and one of the certified planning skills, approve the exact context, and start the plan. `logo` with `upgrade-react-router-to-v8` is the positive local fixture; it is already Vite and is intentionally not a Vite-migration fixture. Do not put the API key into the UI or a repository file.
 
 ### LM Studio or another local OpenAI-compatible server
 

@@ -527,6 +527,14 @@ input:focus {
   font-weight: 680;
 }
 
+.skill-badges {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+}
+
 .catalog-status {
   flex: none;
   padding: 3px 6px;
@@ -548,6 +556,31 @@ input:focus {
 .catalog-status.malformed,
 .catalog-status.duplicate,
 .catalog-status.unstable {
+  border-color: rgba(227, 182, 111, 0.38);
+  color: #d8ad6a;
+  background: rgba(227, 182, 111, 0.06);
+}
+
+.catalog-certification {
+  flex: none;
+  padding: 3px 6px;
+  border: 1px solid rgba(132, 150, 177, 0.34);
+  border-radius: 999px;
+  color: #9ba9bf;
+  background: rgba(132, 150, 177, 0.06);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.catalog-certification.certified {
+  border-color: rgba(111, 137, 186, 0.5);
+  color: #aec4ed;
+  background: rgba(111, 137, 186, 0.12);
+}
+
+.catalog-certification.uncertified {
   border-color: rgba(227, 182, 111, 0.38);
   color: #d8ad6a;
   background: rgba(227, 182, 111, 0.06);

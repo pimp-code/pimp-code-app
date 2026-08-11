@@ -6,15 +6,23 @@ import {
   type RepositoryPreflight,
   resolveRepositoryPreflight,
   selectMigrateToViteContext,
+  selectUpgradeReactRouterToV8Context,
 } from "./repository-context.js";
 import { hashStableJson, sha256, stableJson } from "./stable-json.js";
 import {
   detectViteApplicability,
   type ViteApplicability,
 } from "./vite-applicability.js";
+import {
+  detectReactRouterV8Applicability,
+  type ReactRouterApplicability,
+} from "./router-applicability.js";
+import { assertCertifiedPlanningSkillIdentity } from "./planning-certification.js";
 
 export const MIGRATE_TO_VITE_PREFLIGHT_SCHEMA_VERSION =
   "migrate-to-vite-preflight/v1";
+export const UPGRADE_REACT_ROUTER_TO_V8_PREFLIGHT_SCHEMA_VERSION =
+  "upgrade-react-router-to-v8-preflight/v1";
 
 export interface SelectedSkillInput {
   name: string;
@@ -23,8 +31,10 @@ export interface SelectedSkillInput {
   manifestPath?: string;
 }
 
-export interface SelectedSkillSnapshot {
-  name: "migrate-to-vite";
+export interface SelectedSkillSnapshot<
+  Name extends string = "migrate-to-vite",
+> {
+  name: Name;
   digest: string;
   instructions: string;
   instructionsSha256: string;
@@ -40,6 +50,15 @@ export interface MigrateToVitePreflight {
   preflightSha256: string;
 }
 
+export interface UpgradeReactRouterToV8Preflight {
+  schemaVersion: typeof UPGRADE_REACT_ROUTER_TO_V8_PREFLIGHT_SCHEMA_VERSION;
+  repository: RepositoryPreflight;
+  skill: SelectedSkillSnapshot<"upgrade-react-router-to-v8">;
+  context: RepositoryContextBundle;
+  applicability: ReactRouterApplicability;
+  preflightSha256: string;
+}
+
 function assertSortedUnique(values: readonly string[], label: string): void {
   const sorted = [...new Set(values)].sort();
   if (stableJson(values) !== stableJson(sorted)) {
@@ -47,11 +66,16 @@ function assertSortedUnique(values: readonly string[], label: string): void {
   }
 }
 
-export function assertMigrateToVitePreflightIntegrity(
-  preflight: MigrateToVitePreflight,
+function assertPreflightIntegrity(
+  preflight: MigrateToVitePreflight | UpgradeReactRouterToV8Preflight,
+  expectedSchemaVersion:
+    | typeof MIGRATE_TO_VITE_PREFLIGHT_SCHEMA_VERSION
+    | typeof UPGRADE_REACT_ROUTER_TO_V8_PREFLIGHT_SCHEMA_VERSION,
+  expectedSkillName: "migrate-to-vite" | "upgrade-react-router-to-v8",
+  expectedApplicability: ViteApplicability | ReactRouterApplicability,
 ): void {
-  if (preflight.schemaVersion !== MIGRATE_TO_VITE_PREFLIGHT_SCHEMA_VERSION) {
-    throw new Error("Unsupported migrate-to-vite preflight schema");
+  if (preflight.schemaVersion !== expectedSchemaVersion) {
+    throw new Error(`Unsupported ${expectedSkillName} preflight schema`);
   }
   if (preflight.repository.schemaVersion !== REPOSITORY_PREFLIGHT_SCHEMA_VERSION) {
     throw new Error("Unsupported repository preflight schema");
@@ -65,12 +89,13 @@ export function assertMigrateToVitePreflightIntegrity(
   if (preflight.repository.repositoryIdentitySha256 !== sha256(preflight.repository.repositoryRoot)) {
     throw new Error("Preflight repository identity hash is invalid");
   }
-  if (preflight.skill.name !== "migrate-to-vite") {
-    throw new Error("Preflight skill is not migrate-to-vite");
+  if (preflight.skill.name !== expectedSkillName) {
+    throw new Error(`Preflight skill is not ${expectedSkillName}`);
   }
   if (!/^[a-f0-9]{64}$/u.test(preflight.skill.digest)) {
     throw new Error("Preflight skill digest is invalid");
   }
+  assertCertifiedPlanningSkillIdentity(expectedSkillName, preflight.skill.digest);
   if (preflight.skill.instructionsSha256 !== sha256(preflight.skill.instructions)) {
     throw new Error("Preflight skill instructions hash is invalid");
   }
@@ -123,8 +148,8 @@ export function assertMigrateToVitePreflightIntegrity(
   if (totalContextBytes !== preflight.context.manifest.totalContextBytes) {
     throw new Error("Context total byte count is invalid");
   }
-  if (stableJson(detectViteApplicability(preflight.context)) !== stableJson(preflight.applicability)) {
-    throw new Error("Vite applicability does not match the approved context");
+  if (stableJson(expectedApplicability) !== stableJson(preflight.applicability)) {
+    throw new Error(`${expectedSkillName} applicability does not match the approved context`);
   }
 
   const { preflightSha256, ...preflightWithoutHash } = preflight;
@@ -133,15 +158,41 @@ export function assertMigrateToVitePreflightIntegrity(
   }
 }
 
-function validateSkill(skill: SelectedSkillInput): SelectedSkillSnapshot {
+export function assertMigrateToVitePreflightIntegrity(
+  preflight: MigrateToVitePreflight,
+): void {
+  assertPreflightIntegrity(
+    preflight,
+    MIGRATE_TO_VITE_PREFLIGHT_SCHEMA_VERSION,
+    "migrate-to-vite",
+    detectViteApplicability(preflight.context),
+  );
+}
+
+export function assertUpgradeReactRouterToV8PreflightIntegrity(
+  preflight: UpgradeReactRouterToV8Preflight,
+): void {
+  assertPreflightIntegrity(
+    preflight,
+    UPGRADE_REACT_ROUTER_TO_V8_PREFLIGHT_SCHEMA_VERSION,
+    "upgrade-react-router-to-v8",
+    detectReactRouterV8Applicability(preflight.context),
+  );
+}
+
+function validateSkill<Name extends "migrate-to-vite" | "upgrade-react-router-to-v8">(
+  skill: SelectedSkillInput,
+  expectedName: Name,
+): SelectedSkillSnapshot<Name> {
   const name = skill.name.trim().toLowerCase();
-  if (name !== "migrate-to-vite") {
-    throw new Error("The selected skill must be migrate-to-vite");
+  if (name !== expectedName) {
+    throw new Error(`The selected skill must be ${expectedName}`);
   }
   const digest = skill.digest.trim().toLowerCase();
   if (!/^[a-f0-9]{64}$/u.test(digest)) {
     throw new Error("Selected skill digest must be a SHA-256 hex digest");
   }
+  assertCertifiedPlanningSkillIdentity(expectedName, digest);
   if (!skill.instructions.trim()) throw new Error("Selected skill instructions are required");
   if (Buffer.byteLength(skill.instructions, "utf8") > 256 * 1024) {
     throw new Error("Selected skill instructions exceed the planning limit");
@@ -151,7 +202,7 @@ function validateSkill(skill: SelectedSkillInput): SelectedSkillSnapshot {
   }
 
   return {
-    name: "migrate-to-vite",
+    name: expectedName,
     digest,
     instructions: skill.instructions,
     instructionsSha256: sha256(skill.instructions),
@@ -169,11 +220,41 @@ export async function prepareMigrateToVitePreflight(options: {
     repositoryPath: options.repositoryPath,
     outputRoot: options.outputRoot,
   });
-  const skill = validateSkill(options.skill);
+  const skill = validateSkill(options.skill, "migrate-to-vite");
   const context = await selectMigrateToViteContext(repository, options.limits);
   const applicability = detectViteApplicability(context);
   const withoutHash: Omit<MigrateToVitePreflight, "preflightSha256"> = {
     schemaVersion: MIGRATE_TO_VITE_PREFLIGHT_SCHEMA_VERSION,
+    repository,
+    skill,
+    context,
+    applicability,
+  };
+
+  return {
+    ...withoutHash,
+    preflightSha256: hashStableJson(withoutHash),
+  };
+}
+
+export async function prepareUpgradeReactRouterToV8Preflight(options: {
+  repositoryPath: string;
+  outputRoot: string;
+  skill: SelectedSkillInput;
+  limits?: Partial<ContextSelectionLimits>;
+}): Promise<UpgradeReactRouterToV8Preflight> {
+  const repository = await resolveRepositoryPreflight({
+    repositoryPath: options.repositoryPath,
+    outputRoot: options.outputRoot,
+  });
+  const skill = validateSkill(options.skill, "upgrade-react-router-to-v8");
+  const context = await selectUpgradeReactRouterToV8Context(
+    repository,
+    options.limits,
+  );
+  const applicability = detectReactRouterV8Applicability(context);
+  const withoutHash: Omit<UpgradeReactRouterToV8Preflight, "preflightSha256"> = {
+    schemaVersion: UPGRADE_REACT_ROUTER_TO_V8_PREFLIGHT_SCHEMA_VERSION,
     repository,
     skill,
     context,

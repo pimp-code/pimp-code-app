@@ -23,6 +23,8 @@ const MAX_UTILITY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGENT_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SKILL_ROOTS: usize = 16;
 const MAX_SKILL_ROOT_LENGTH: usize = 2_000;
+const MAX_REPOSITORY_LENGTH: usize = 2_000;
+const MAX_SKILL_ID_LENGTH: usize = 200;
 
 #[derive(Default)]
 struct AgentProcessState {
@@ -443,13 +445,36 @@ async fn provider_health(app: AppHandle, provider: ProviderConfig) -> Result<Val
     .await
 }
 
+fn prepare_plan_utility_request(
+    repository: &str,
+    skill_id: &str,
+    skill_root: &str,
+    configured_roots: &[String],
+    preflight_root: &Path,
+) -> Value {
+    json!({
+        "operation": "prepare_plan",
+        "repository": repository.trim(),
+        "skillId": skill_id.trim(),
+        "skillRoot": skill_root.trim(),
+        "configuredRoots": configured_roots,
+        "preflightRoot": node_compatible_path(preflight_root).to_string_lossy(),
+    })
+}
+
 #[tauri::command]
-async fn prepare_migrate_to_vite(
+async fn prepare_plan(
     app: AppHandle,
     repository: String,
     skill_id: String,
     skill_root: String,
 ) -> Result<Value, String> {
+    if repository.trim().is_empty()
+        || repository.len() > MAX_REPOSITORY_LENGTH
+        || repository.chars().any(char::is_control)
+    {
+        return Err("The repository path is invalid or too long".to_string());
+    }
     let configured_roots = read_skill_roots(&app)?;
     if !configured_roots
         .iter()
@@ -457,7 +482,10 @@ async fn prepare_migrate_to_vite(
     {
         return Err("The selected skill root is not configured".to_string());
     }
-    if skill_id.trim().is_empty() || skill_id.len() > 200 {
+    if skill_id.trim().is_empty()
+        || skill_id.len() > MAX_SKILL_ID_LENGTH
+        || skill_id.chars().any(char::is_control)
+    {
         return Err("The selected skill ID is invalid".to_string());
     }
     let preflight_root = app
@@ -471,18 +499,14 @@ async fn prepare_migrate_to_vite(
             preflight_root.display()
         )
     })?;
-    run_agent_utility(
-        &app,
-        json!({
-            "operation": "prepare_migrate_to_vite",
-            "repository": repository,
-            "skillId": skill_id,
-            "skillRoot": skill_root,
-            "configuredRoots": configured_roots,
-            "preflightRoot": node_compatible_path(&preflight_root).to_string_lossy(),
-        }),
-    )
-    .await
+    let request = prepare_plan_utility_request(
+        &repository,
+        &skill_id,
+        &skill_root,
+        &configured_roots,
+        &preflight_root,
+    );
+    run_agent_utility(&app, request).await
 }
 
 fn emit_diagnostic(app: &AppHandle, run_id: &str, level: &str, message: impl Into<String>) {
@@ -901,7 +925,7 @@ pub fn run() {
             load_skill_roots,
             save_skill_roots,
             scan_skill_catalog,
-            prepare_migrate_to_vite,
+            prepare_plan,
             provider_health,
             start_agent,
             start_plan,
@@ -914,7 +938,8 @@ pub fn run() {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::node_compatible_path;
+    use super::{node_compatible_path, prepare_plan_utility_request};
+    use serde_json::json;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -933,5 +958,24 @@ mod tests {
     fn preserves_regular_windows_paths() {
         let path = Path::new(r"C:\workspace\agent-host\cli.js");
         assert_eq!(node_compatible_path(path), path);
+    }
+
+    #[test]
+    fn prepare_plan_utility_request_uses_generic_contract() {
+        let configured_roots = vec![r"C:\workspace\skills".to_string()];
+        let request = prepare_plan_utility_request(
+            r" C:\workspace\repository ",
+            " skill-entry-id ",
+            r" C:\workspace\skills ",
+            &configured_roots,
+            Path::new(r"C:\app-data\preflights"),
+        );
+
+        assert_eq!(request["operation"], "prepare_plan");
+        assert_eq!(request["repository"], r"C:\workspace\repository");
+        assert_eq!(request["skillId"], "skill-entry-id");
+        assert_eq!(request["skillRoot"], r"C:\workspace\skills");
+        assert_eq!(request["configuredRoots"], json!(configured_roots));
+        assert_eq!(request["preflightRoot"], r"C:\app-data\preflights");
     }
 }

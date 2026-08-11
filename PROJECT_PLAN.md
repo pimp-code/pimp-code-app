@@ -292,6 +292,7 @@ The official-document broker accepts only engine-selected domains from a version
 | `setup-eslint-typescript`        | Package metadata, installs, config writes, lint baseline        | First dependency/tooling vertical slice                                   |
 | React 16→17→18→19                | Current docs, dependency graph, runtime/test validation         | High-risk after patch/verification engine is proven                       |
 | `migrate-to-vite`                | Build/deploy/env parity, installs, browser/runtime validation   | High-risk                                                                 |
+| `upgrade-react-router-to-v8`     | Route parity, runtime baselines, dependency/source/test changes | Second certified plan-only adapter; apply remains high-risk               |
 | `migrate-to-zustand`             | Whole-app state tracing, persistent checklist, Python validator | High-risk; bundled script needs explicit policy                           |
 | `migrate-to-typescript-7`        | Current compiler/toolchain compatibility, CI/editor consumers   | High-risk and highly time-sensitive                                       |
 | Design review/planning skills    | Running app, screenshots, responsive/accessibility/visual QA    | Add after browser and visual evidence tools exist                         |
@@ -519,10 +520,10 @@ Deliverables:
 - app-owned immutable plan/run artifacts and an in-session normalized timeline;
 - Claude Code as the first Claude runtime adapter plus the explicitly labelled loopback compatibility bridge for the first local-model path;
 - provider/runtime health checks, available model discovery where supported, and configurable bounded turn limits;
-- context/egress preview and a clearly labelled `migrate-to-vite` plan-only workflow with structured Markdown and JSON output;
+- context/egress preview and certified `migrate-to-vite` and `upgrade-react-router-to-v8` plan-only workflows with structured Markdown and JSON output;
 - cancellation, timeout, crash recovery, and schema-validation paths.
 
-Exit: the same fixture repository and `migrate-to-vite` plan-only skill mode produce valid audited plans through Claude and one local model with zero target writes or project processes. Full migration Apply and `rescue-the-project` diagnosis remain uncertified until guarded writes and commands exist.
+Exit: applicable fixture repositories for both certified plan adapters produce valid audited plans through Claude and one local model with zero target writes or project processes. Full migration Apply and `rescue-the-project` diagnosis remain uncertified until guarded writes and commands exist.
 
 ### Phase 2 — Guarded patch vertical slice
 
@@ -713,5 +714,5 @@ If the goal is to reach a trustworthy beta quickly, use these defaults:
 1. **Complete:** commit the verified Tauri feasibility spike and this architecture update.
 2. **Implementation complete; release gate pending:** replace workspace/system runtime lookup with checksum-pinned packaged Node, agent-host, and Claude Code resources. The NSIS installer builds locally; a clean second-Windows-machine install plus live Claude and local-model runs still gate portability.
 3. **Complete:** implement the recursive `../skills/**/SKILL.md` catalog, including malformed/orphaned metadata visibility, package digests, inert scripts, path/link rejection, and configurable roots.
-4. **Implementation complete; live smoke pending:** build the `migrate-to-vite` read-only slice with canonical repository confirmation, applicability and exact context preview, explicit Claude egress approval, zero model tools, structured plan validation, and app-owned Markdown/JSON artifacts.
+4. **Implementation complete; live smoke pending:** build certified `migrate-to-vite` and `upgrade-react-router-to-v8` read-only adapters with canonical repository confirmation, applicability and exact context preview, explicit Claude egress approval, zero model tools, structured plan validation, and app-owned Markdown/JSON artifacts. The `logo` repository is the positive Router 5 fixture.
 5. **Next:** add durable state-machine history before enabling any target write or project command.

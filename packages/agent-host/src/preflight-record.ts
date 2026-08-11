@@ -2,8 +2,9 @@ import { readFile, lstat, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { scanSkillCatalog } from "@pimp-code/skill-runtime";
 import {
-  assertMigrateToVitePreflightIntegrity,
-  type MigrateToVitePreflight,
+  assertPlanningPreflightIntegrity,
+  isPlanningSkillSupported,
+  type PlanningPreflight,
 } from "./planning/index.js";
 import { sha256 } from "./planning/stable-json.js";
 
@@ -15,7 +16,7 @@ export interface StoredPreflightRecord {
   createdAt: string;
   skillCatalogEntryId: string;
   skillPackageRoot: string;
-  preflight: MigrateToVitePreflight;
+  preflight: PlanningPreflight;
 }
 
 function requireObject(value: unknown, label: string): Record<string, unknown> {
@@ -76,21 +77,20 @@ export async function loadStoredPreflight(
   ) {
     throw new Error("Preflight record metadata is malformed");
   }
-  const preflight = requireObject(record.preflight, "preflight") as unknown as MigrateToVitePreflight;
+  const preflight = requireObject(record.preflight, "preflight") as unknown as PlanningPreflight;
   if (
-    preflight.schemaVersion !== "migrate-to-vite-preflight/v1" ||
     preflight.repository?.outputRoot !== dirname(canonicalPath) ||
-    preflight.skill?.name !== "migrate-to-vite" ||
+    !isPlanningSkillSupported(preflight.skill?.name ?? "") ||
     !Array.isArray(preflight.context?.manifest?.files) ||
     !Array.isArray(preflight.context?.documents) ||
     preflight.context.manifest.files.length === 0 ||
     preflight.applicability?.status !== "applicable"
   ) {
     throw new Error(
-      "Stored preflight must be a non-empty, applicable migrate-to-vite snapshot",
+      "Stored preflight must be a non-empty, applicable supported planning snapshot",
     );
   }
-  assertMigrateToVitePreflightIntegrity(preflight);
+  assertPlanningPreflightIntegrity(preflight);
 
   return {
     schemaVersion: "pimp.preflight-record.v1",
@@ -134,7 +134,9 @@ export async function assertStoredPreflightCurrent(
     (entry) =>
       entry.id === record.skillCatalogEntryId &&
       entry.status === "valid" &&
-      entry.digest === record.preflight.skill.digest,
+      entry.name === record.preflight.skill.name &&
+      entry.digest === record.preflight.skill.digest &&
+      entry.instructions === record.preflight.skill.instructions,
   );
   if (!matching) {
     throw new Error("Selected skill package changed or is no longer valid");

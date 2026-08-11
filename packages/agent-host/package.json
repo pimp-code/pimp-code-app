@@ -6,7 +6,7 @@
   "main": "dist/src/cli.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/tests/local-anthropic-bridge.test.js dist/tests/agent-sdk-local-smoke.test.js dist/tests/command-controller.test.js dist/tests/planning.test.js dist/tests/provider-health.test.js",
+    "test": "npm run build && node --test dist/tests/local-anthropic-bridge.test.js dist/tests/agent-sdk-local-smoke.test.js dist/tests/command-controller.test.js dist/tests/planning.test.js dist/tests/router-planning.test.js dist/tests/provider-health.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

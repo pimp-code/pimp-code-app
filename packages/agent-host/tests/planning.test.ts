@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   lstat,
@@ -13,17 +14,26 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { scanSkillCatalog } from "@pimp-code/skill-runtime";
 import {
   startPlanRun,
   type PlanRunnerDependencies,
 } from "../src/plan-runner.js";
 import type { HostEvent } from "../src/protocol.js";
 import {
+  assertStoredPreflightCurrent,
+  loadStoredPreflight,
+} from "../src/preflight-record.js";
+import {
+  CERTIFIED_PLANNING_ADAPTERS,
   MIGRATE_TO_VITE_PLAN_SCHEMA_VERSION,
   MIGRATE_TO_VITE_PLAN_V1_SCHEMA,
   PlanValidationError,
   assertMigrateToVitePreflightIntegrity,
   buildMigrateToVitePlanPrompt,
+  isCertifiedPlanningSkillIdentity,
+  isPlanningSkillSupported,
   parseMigrateToVitePlanV1,
   pathIsWithin,
   prepareMigrateToVitePreflight,
@@ -38,6 +48,8 @@ import { stableJson } from "../src/planning/stable-json.js";
 const SECRET_ENV_VALUE = "do-not-send-env-value";
 const SECRET_CONFIG_VALUE = "do-not-send-config-secret";
 const OUTSIDE_MARKER = "parent-config-must-not-be-read";
+const MIGRATE_TO_VITE_CERTIFIED_DIGEST =
+  CERTIFIED_PLANNING_ADAPTERS["migrate-to-vite"].packageDigests[0];
 
 interface PlanningFixture {
   base: string;
@@ -49,6 +61,31 @@ interface PlanningFixture {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+async function runUtilityRequest(request: unknown): Promise<Record<string, unknown>> {
+  const utilityPath = fileURLToPath(new URL("../src/utility-cli.js", import.meta.url));
+  const child = spawn(process.execPath, [utilityPath], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+  child.stdin.end(JSON.stringify(request));
+  const exitCode = await new Promise<number | null>((resolveExit, reject) => {
+    child.once("error", reject);
+    child.once("close", resolveExit);
+  });
+  if (exitCode !== 0) {
+    throw new Error(`Utility exited ${exitCode}: ${Buffer.concat(stderr).toString("utf8")}`);
+  }
+  const value = JSON.parse(Buffer.concat(stdout).toString("utf8")) as unknown;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Utility response is not an object");
+  }
+  return value as Record<string, unknown>;
 }
 
 async function makeFixture(options: { createSymlink?: boolean } = {}): Promise<PlanningFixture> {
@@ -159,7 +196,7 @@ async function makeFixture(options: { createSymlink?: boolean } = {}): Promise<P
     outputRoot,
     skill: {
       name: "migrate-to-vite",
-      digest: "a".repeat(64),
+      digest: MIGRATE_TO_VITE_CERTIFIED_DIGEST,
       instructions: [
         "Inventory the current frontend pipeline.",
         "Plan a parity-preserving Vite migration without changing files.",
@@ -193,7 +230,7 @@ async function makeNotApplicableFixture(): Promise<PlanningFixture> {
     outputRoot,
     skill: {
       name: "migrate-to-vite",
-      digest: "c".repeat(64),
+      digest: MIGRATE_TO_VITE_CERTIFIED_DIGEST,
       instructions: "Determine applicability and produce a plan only.",
     },
   });
@@ -303,6 +340,139 @@ function planFor(preflight: MigrateToVitePreflight): MigrateToVitePlanV1 {
   };
 }
 
+test("planning adapter names remain discoverable while package identities fail closed", async () => {
+  assert.equal(isPlanningSkillSupported("migrate-to-vite"), true);
+  assert.equal(
+    isCertifiedPlanningSkillIdentity(
+      "migrate-to-vite",
+      MIGRATE_TO_VITE_CERTIFIED_DIGEST,
+    ),
+    true,
+  );
+  assert.equal(
+    isCertifiedPlanningSkillIdentity("migrate-to-vite", "0".repeat(64)),
+    false,
+  );
+  const fixture = await makeFixture();
+  try {
+    await assert.rejects(
+      prepareMigrateToVitePreflight({
+        repositoryPath: fixture.repository,
+        outputRoot: fixture.outputRoot,
+        skill: {
+          name: "migrate-to-vite",
+          digest: "0".repeat(64),
+          instructions: "Unreviewed instructions.",
+        },
+      }),
+      /not certified for planning/u,
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
+test("generic prepare_plan accepts the certified migrate package and currentness binds exact instructions", async () => {
+  const fixture = await makeFixture();
+  try {
+    const skillRoot = fileURLToPath(new URL("../../../../../skills/", import.meta.url));
+    const catalog = await scanSkillCatalog([skillRoot]);
+    const entry = catalog.entries.find(
+      (candidate) =>
+        candidate.name === "migrate-to-vite" &&
+        candidate.digest === MIGRATE_TO_VITE_CERTIFIED_DIGEST,
+    );
+    assert.ok(entry);
+    const certifiedCatalogResponse = await runUtilityRequest({
+      operation: "scan_skill_catalog",
+      roots: [skillRoot],
+    });
+    const certifiedCatalog = certifiedCatalogResponse.data as {
+      entries?: Array<{ name?: string; planningSupported?: boolean }>;
+    };
+    assert.equal(
+      certifiedCatalog.entries?.find((candidate) => candidate.name === "migrate-to-vite")
+        ?.planningSupported,
+      true,
+    );
+
+    const unreviewedRoot = join(fixture.base, "unreviewed-skills");
+    const unreviewedPackage = join(unreviewedRoot, "migrate-to-vite");
+    await mkdir(unreviewedPackage, { recursive: true });
+    await writeFile(
+      join(unreviewedPackage, "SKILL.md"),
+      [
+        "---",
+        "name: migrate-to-vite",
+        "description: Unreviewed package with a certified adapter name.",
+        "---",
+        "Produce an unreviewed plan.",
+        "",
+      ].join("\n"),
+    );
+    const unreviewedCatalogResponse = await runUtilityRequest({
+      operation: "scan_skill_catalog",
+      roots: [unreviewedRoot],
+    });
+    const unreviewedCatalog = unreviewedCatalogResponse.data as {
+      entries?: Array<{ id?: string; name?: string; planningSupported?: boolean }>;
+    };
+    const unreviewedEntry = unreviewedCatalog.entries?.find(
+      (candidate) => candidate.name === "migrate-to-vite",
+    );
+    assert.equal(
+      unreviewedEntry?.planningSupported,
+      false,
+    );
+
+    const preflightRoot = join(fixture.base, "utility-preflights");
+    await mkdir(preflightRoot);
+    assert.ok(unreviewedEntry?.id);
+    const rejectedUnreviewed = await runUtilityRequest({
+      operation: "prepare_plan",
+      repository: fixture.repository,
+      skillId: unreviewedEntry.id,
+      skillRoot: unreviewedRoot,
+      configuredRoots: [unreviewedRoot],
+      preflightRoot,
+    });
+    assert.equal(rejectedUnreviewed.ok, false);
+    assert.match(String(rejectedUnreviewed.error), /digest is not certified/u);
+
+    const response = await runUtilityRequest({
+      operation: "prepare_plan",
+      repository: fixture.repository,
+      skillId: entry.id,
+      skillRoot,
+      configuredRoots: [skillRoot],
+      preflightRoot,
+    });
+    assert.equal(response.ok, true);
+    const data = response.data as {
+      id?: string;
+      skill?: { name?: string; digest?: string };
+      applicability?: { verdict?: string };
+    };
+    assert.equal(data.skill?.name, "migrate-to-vite");
+    assert.equal(data.skill?.digest, MIGRATE_TO_VITE_CERTIFIED_DIGEST);
+    assert.equal(data.applicability?.verdict, "applicable");
+    assert.ok(data.id);
+
+    const record = await loadStoredPreflight(
+      join(preflightRoot, data.id, "preflight.json"),
+    );
+    await assertStoredPreflightCurrent(record);
+    const altered = structuredClone(record);
+    altered.preflight.skill.instructions += "\nUnreviewed instruction.";
+    await assert.rejects(
+      assertStoredPreflightCurrent(altered),
+      /skill package changed or is no longer valid/u,
+    );
+  } finally {
+    await cleanupFixture(fixture);
+  }
+});
+
 test("preflight stays at the exact canonical root and emits sanitized deterministic context", async () => {
   const fixture = await makeFixture();
   try {
@@ -411,7 +581,7 @@ test("preflight rejects root/output overlap and never follows repository symlink
         outputRoot: nestedOutput,
         skill: {
           name: "migrate-to-vite",
-          digest: "b".repeat(64),
+          digest: MIGRATE_TO_VITE_CERTIFIED_DIGEST,
           instructions: "Plan only.",
         },
       }),
@@ -637,7 +807,7 @@ test("a malformed selected package manifest yields uncertain applicability", asy
       outputRoot,
       skill: {
         name: "migrate-to-vite",
-        digest: "d".repeat(64),
+        digest: MIGRATE_TO_VITE_CERTIFIED_DIGEST,
         instructions: "Classify the selected workspace without executing its files.",
       },
     });
@@ -744,6 +914,13 @@ test("plan runner gives the provider only the approved snapshot and zero tools",
       return {
         async *[Symbol.asyncIterator]() {
           yield {
+            type: "system",
+            subtype: "init",
+            claude_code_version: "test",
+            model: "sonnet",
+            tools: [],
+          };
+          yield {
             type: "result",
             subtype: "success",
             duration_ms: 125,
@@ -798,6 +975,16 @@ test("plan runner gives the provider only the approved snapshot and zero tools",
     assert.equal(request.options.persistSession, false);
     assert.equal(request.options.cwd, fixture.preflight.repository.outputRoot);
     assert.equal(events.some((event) => event.type === "tool_call"), false);
+    const planningStatus = events.find(
+      (event) => event.type === "status" && event.phase === "planning",
+    );
+    assert.ok(planningStatus?.type === "status");
+    assert.equal("tools" in (planningStatus.details ?? {}), false);
+    const initializedStatus = events.find(
+      (event) => event.type === "status" && event.phase === "agent-initialized",
+    );
+    assert.ok(initializedStatus?.type === "status");
+    assert.deepEqual(initializedStatus.details?.tools, []);
 
     const result = events.find((event) => event.type === "result");
     assert.ok(result?.type === "result" && result.success);
@@ -808,6 +995,112 @@ test("plan runner gives the provider only the approved snapshot and zero tools",
     assert.ok(result.artifacts?.json);
     assert.ok(result.artifacts?.metadata);
     assert.ok(pathIsWithin(fixture.outputRoot, result.artifacts.markdown));
+  } finally {
+    if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previousApiKey;
+    await cleanupFixture(fixture);
+  }
+});
+
+test("plan runner fails closed when the SDK cannot prove the zero-tool boundary", async () => {
+  const fixture = await makeFixture();
+  const previousApiKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "planning-boundary-test-key";
+  try {
+    const runScenario = async (
+      runId: string,
+      messages: readonly unknown[],
+    ): Promise<{ events: HostEvent[]; aborted: boolean }> => {
+      const events: HostEvent[] = [];
+      let capturedRequest: { options?: { abortController?: AbortController } } = {};
+      const fakeQuery = ((request: unknown) => {
+        capturedRequest = request as typeof capturedRequest;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for (const message of messages) yield message;
+          },
+        };
+      }) as unknown as NonNullable<PlanRunnerDependencies["query"]>;
+      const run = startPlanRun(
+        {
+          type: "start_plan",
+          runId,
+          preflightPath: join(fixture.outputRoot, "preflight.json"),
+          maxTurns: 2,
+          provider: { kind: "claude", model: "sonnet" },
+          remoteEgressApproved: true,
+        },
+        (event) => events.push(event),
+        {
+          query: fakeQuery,
+          loadPreflight: async () => ({
+            schemaVersion: "pimp.preflight-record.v1",
+            id: "b88b846e-6c0c-4f9d-b4f6-b2e2690f5bb1",
+            createdAt: "2026-08-11T00:00:00.000Z",
+            skillCatalogEntryId: "test-skill",
+            skillPackageRoot: join(fixture.base, "skill"),
+            preflight: fixture.preflight,
+          }),
+          assertCurrent: async () => undefined,
+        },
+      );
+      await run.done;
+      return {
+        events,
+        aborted: capturedRequest.options?.abortController?.signal.aborted === true,
+      };
+    };
+
+    const advertised = await runScenario(
+      "1709d974-1db0-420b-b68d-9d3e447ed907",
+      [{
+        type: "system", subtype: "init", claude_code_version: "test",
+        model: "sonnet", tools: ["Read"],
+      }],
+    );
+    const advertisedResult = advertised.events.find((event) => event.type === "result");
+    assert.ok(advertisedResult?.type === "result" && !advertisedResult.success);
+    assert.match(advertisedResult.error ?? "", /advertised tools: Read/u);
+    assert.equal(advertised.aborted, true);
+    assert.equal(
+      advertised.events.some(
+        (event) => event.type === "status" && event.phase === "agent-initialized",
+      ),
+      false,
+    );
+
+    const toolUse = await runScenario(
+      "50d37b2c-6a16-4dd0-90f6-a7d43dac68ec",
+      [
+        {
+          type: "system", subtype: "init", claude_code_version: "test",
+          model: "sonnet", tools: [],
+        },
+        {
+          type: "assistant",
+          message: {
+            content: [{ type: "tool_use", id: "tool-1", name: "Read", input: {} }],
+          },
+        },
+      ],
+    );
+    const toolUseResult = toolUse.events.find((event) => event.type === "result");
+    assert.ok(toolUseResult?.type === "result" && !toolUseResult.success);
+    assert.match(toolUseResult.error ?? "", /forbidden tool_use block/u);
+    assert.equal(toolUse.aborted, true);
+
+    const noInit = await runScenario(
+      "2a7d7d85-783c-45ec-a2a0-9fa4ae693159",
+      [{
+        type: "result", subtype: "success", duration_ms: 1, num_turns: 1,
+        result: "", session_id: "no-init", structured_output: planFor(fixture.preflight),
+        total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 },
+      }],
+    );
+    const noInitResult = noInit.events.find((event) => event.type === "result");
+    assert.ok(noInitResult?.type === "result" && !noInitResult.success);
+    assert.match(noInitResult.error ?? "", /before a verified empty tool inventory/u);
+    assert.equal(noInit.aborted, true);
   } finally {
     if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = previousApiKey;

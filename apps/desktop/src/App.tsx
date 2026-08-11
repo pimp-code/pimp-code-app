@@ -53,7 +53,6 @@ const DEFAULT_ENDPOINT = "http://127.0.0.1:1234/v1";
 const DEFAULT_MAX_TURNS = 10;
 const MIN_MAX_TURNS = 1;
 const MAX_MAX_TURNS = 20;
-const RUNNABLE_SKILL = "migrate-to-vite";
 
 function safeDetail(value: unknown): string {
   if (typeof value === "string") return value;
@@ -89,13 +88,51 @@ function issueText(issue: CatalogIssue): string {
   return [issue.code, issue.path, issue.message].filter(Boolean).join(" · ");
 }
 
+function hasText(value: string | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 function isRunnableSkill(entry: SkillCatalogEntry): boolean {
   return (
     entry.status === "valid" &&
-    entry.name === RUNNABLE_SKILL &&
-    entry.digest.length > 0 &&
-    entry.rootPath.length > 0
+    entry.planningSupported &&
+    hasText(entry.id) &&
+    hasText(entry.name) &&
+    hasText(entry.digest) &&
+    hasText(entry.rootPath)
   );
+}
+
+function assertPreparedPreflightMatchesSkill(
+  preflight: PlanPreflight,
+  selectedSkill: SkillCatalogEntry,
+): void {
+  if (
+    !hasText(preflight.id) ||
+    !hasText(preflight.canonicalRepository) ||
+    !hasText(preflight.contextManifest.hash) ||
+    !hasText(preflight.skill.id) ||
+    !hasText(preflight.skill.name) ||
+    !hasText(preflight.skill.digest) ||
+    !hasText(preflight.skill.packageRoot)
+  ) {
+    throw new Error("Planning preflight response is incomplete.");
+  }
+  if (
+    preflight.skill.id !== selectedSkill.id ||
+    preflight.skill.name !== selectedSkill.name ||
+    preflight.skill.digest !== selectedSkill.digest
+  ) {
+    throw new Error(
+      "Planning preflight does not match the selected skill package.",
+    );
+  }
+  if (
+    hasText(preflight.remoteEgress.contextHash) &&
+    preflight.remoteEgress.contextHash !== preflight.contextManifest.hash
+  ) {
+    throw new Error("Planning preflight contains inconsistent context hashes.");
+  }
 }
 
 function catalogEntryName(entry: SkillCatalogEntry): string {
@@ -131,6 +168,8 @@ export function App() {
   const [checkingProvider, setCheckingProvider] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const sequence = useRef(0);
+  const preflightRevision = useRef(0);
+  const providerHealthRevision = useRef(0);
 
   const selectedSkill = useMemo(
     () => catalog?.entries.find((entry) => entry.id === selectedSkillId),
@@ -178,6 +217,8 @@ export function App() {
     isRunnableSkill(selectedSkill) &&
     providerReady &&
     model.trim().length > 0 &&
+    !loadingRoots &&
+    !scanningCatalog &&
     !preparing &&
     !running;
   const canStart =
@@ -206,15 +247,25 @@ export function App() {
   );
 
   const invalidatePreflight = useCallback(() => {
+    preflightRevision.current += 1;
     setPreflight(undefined);
     setCanonicalConfirmed(false);
     setRemoteEgressApproved(false);
   }, []);
 
+  const invalidateProviderHealth = useCallback(() => {
+    providerHealthRevision.current += 1;
+    setProviderHealth(undefined);
+  }, []);
+
   const applyCatalog = useCallback((nextCatalog: SkillCatalog) => {
     setCatalog(nextCatalog);
     setSelectedSkillId((current) => {
-      if (nextCatalog.entries.some((entry) => entry.id === current)) {
+      if (
+        nextCatalog.entries.some(
+          (entry) => entry.id === current && isRunnableSkill(entry),
+        )
+      ) {
         return current;
       }
       return "";
@@ -461,7 +512,7 @@ export function App() {
   const changeProvider = (nextProvider: ProviderKind) => {
     setProviderKind(nextProvider);
     setModel(nextProvider === "claude" ? "sonnet" : "");
-    setProviderHealth(undefined);
+    invalidateProviderHealth();
     invalidatePreflight();
   };
 
@@ -470,8 +521,11 @@ export function App() {
     setCheckingProvider(true);
     setProviderHealth(undefined);
     invalidatePreflight();
+    const revision = providerHealthRevision.current + 1;
+    providerHealthRevision.current = revision;
     try {
       const rawHealth = await invoke<unknown>("provider_health", { provider });
+      if (revision !== providerHealthRevision.current) return;
       const health = normalizeProviderHealth(rawHealth);
       setProviderHealth(health);
       if (!model.trim() && health.models[0]) setModel(health.models[0].id);
@@ -484,7 +538,9 @@ export function App() {
             : "Provider health check failed."),
       });
     } catch (error) {
-      setNotice({ tone: "error", message: errorMessage(error) });
+      if (revision === providerHealthRevision.current) {
+        setNotice({ tone: "error", message: errorMessage(error) });
+      }
     } finally {
       setCheckingProvider(false);
     }
@@ -495,13 +551,16 @@ export function App() {
     setPreparing(true);
     setNotice(undefined);
     invalidatePreflight();
+    const revision = preflightRevision.current;
     try {
-      const rawPreflight = await invoke<unknown>("prepare_migrate_to_vite", {
+      const rawPreflight = await invoke<unknown>("prepare_plan", {
         repository: repository.trim(),
         skillId: selectedSkill.id,
         skillRoot: selectedSkill.rootPath,
       });
+      if (revision !== preflightRevision.current) return;
       const nextPreflight = normalizePreflight(rawPreflight);
+      assertPreparedPreflightMatchesSkill(nextPreflight, selectedSkill);
       setPreflight(nextPreflight);
       setNotice({
         tone:
@@ -514,7 +573,9 @@ export function App() {
             : "The selected skill is not yet approved for this repository.",
       });
     } catch (error) {
-      setNotice({ tone: "error", message: errorMessage(error) });
+      if (revision === preflightRevision.current) {
+        setNotice({ tone: "error", message: errorMessage(error) });
+      }
     } finally {
       setPreparing(false);
     }
@@ -567,7 +628,7 @@ export function App() {
       <header className="hero">
         <div>
           <p className="eyebrow">Read-only vertical slice</p>
-          <h1>Plan a safe Vite migration</h1>
+          <h1>Plan a safe codebase migration</h1>
           <p className="subtitle">
             Pin the repository and skill package, inspect the exact context, then
             run a structured plan without modifying the target project.
@@ -663,7 +724,10 @@ export function App() {
               <span>02</span>
               <div>
                 <h2 id="skill-heading">Skill catalog</h2>
-                <p>Packages are validated and hashed; scripts stay inactive.</p>
+                <p>
+                  Catalog validity and execution certification are independent;
+                  scripts stay inactive.
+                </p>
               </div>
               <button
                 type="button"
@@ -751,8 +815,21 @@ export function App() {
                       <span className="skill-card-body">
                         <span className="skill-title-row">
                           <strong>{catalogEntryName(entry)}</strong>
-                          <span className={`catalog-status ${entry.status}`}>
-                            {entry.status}
+                          <span className="skill-badges">
+                            <span className={`catalog-status ${entry.status}`}>
+                              {entry.status}
+                            </span>
+                            {entry.status === "valid" ? (
+                              <span
+                                className={`catalog-certification ${
+                                  entry.planningSupported ? "certified" : "uncertified"
+                                }`}
+                              >
+                                {entry.planningSupported
+                                  ? "Certified · plan-only"
+                                  : "Catalog valid · not certified"}
+                              </span>
+                            ) : null}
                           </span>
                         </span>
                         <small>
@@ -765,8 +842,10 @@ export function App() {
                           <span>
                             {entry.fileCount} files · {formatBytes(entry.totalBytes)}
                           </span>
-                          {!runnable && entry.status === "valid" ? (
-                            <span>Catalog only</span>
+                          {!runnable &&
+                          entry.planningSupported &&
+                          entry.status === "valid" ? (
+                            <span>Planning package metadata incomplete</span>
                           ) : null}
                         </span>
                       </span>
@@ -862,7 +941,7 @@ export function App() {
                   value={endpoint}
                   onChange={(event) => {
                     setEndpoint(event.target.value);
-                    setProviderHealth(undefined);
+                    invalidateProviderHealth();
                     invalidatePreflight();
                   }}
                   placeholder={DEFAULT_ENDPOINT}
@@ -889,7 +968,7 @@ export function App() {
                   value={model}
                   onChange={(event) => {
                     setModel(event.target.value);
-                    setProviderHealth(undefined);
+                    invalidateProviderHealth();
                     invalidatePreflight();
                   }}
                   placeholder={
@@ -912,12 +991,16 @@ export function App() {
                   type="number"
                   min={MIN_MAX_TURNS}
                   max={MAX_MAX_TURNS}
+                  step={1}
                   value={maxTurns}
                   onChange={(event) => {
                     const value = Number(event.target.value);
                     setMaxTurns(
                       Number.isFinite(value)
-                        ? Math.min(MAX_MAX_TURNS, Math.max(MIN_MAX_TURNS, value))
+                        ? Math.min(
+                            MAX_MAX_TURNS,
+                            Math.max(MIN_MAX_TURNS, Math.trunc(value)),
+                          )
                         : DEFAULT_MAX_TURNS,
                     );
                   }}
@@ -1195,7 +1278,7 @@ export function App() {
             <div className="output-header">
               <div>
                 <p className="eyebrow">Structured artifact</p>
-                <h2 id="output-heading">Migration plan</h2>
+                <h2 id="output-heading">Structured plan</h2>
               </div>
               {runId ? <code className="run-id">{runId.slice(0, 12)}</code> : null}
             </div>
