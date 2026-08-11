@@ -482,6 +482,77 @@ Phase 0 must select and prove a Windows containment mechanism with resource limi
 9. **Publish/recovery** — apply/export/discard, conflicts, rollback instructions, optional report/checklist export.
 10. **History/settings** — immutable runs, clone with another model, budgets, storage cleanup, provider and skill management.
 
+### Persistent application model and navigation
+
+The current single-screen plan wizard is a feasibility surface, not the intended product structure. Replace it with a persistent application shell built around saved projects, provider profiles, project-scoped skills, and durable jobs.
+
+Primary navigation:
+
+- a project switcher at the top, with **Add project** and **Manage projects** as the single place where target paths are added, renamed, relinked, or removed from the app;
+- project-scoped **Overview**, **Skills**, and **Jobs** pages;
+- global **Provider profiles**, **Skill sources**, and **Settings** pages;
+- an active-job indicator that remains visible when the user switches projects;
+- a global history view that can show jobs across all projects while project history remains filtered by default.
+
+The normal launch flow is:
+
+```text
+Saved project -> Project skills -> Start job -> Mode + LLM profile
+-> Preflight/context approval -> Plan and/or execute -> Durable job workspace
+```
+
+#### Saved projects
+
+- Persist many projects in app-owned configuration and remember the last active project.
+- Store both the user-entered path and the confirmed canonical repository/workspace path. Deduplicate by canonical path, including Windows case, symlink, and UNC behavior.
+- Allow an optional monorepo workspace selection without losing the containing repository identity.
+- A moved or unavailable folder remains in the library with a **Relink** action; it is not silently deleted and its previous jobs remain accessible.
+- Removing a project from the library never deletes repository files. Deleting its app-owned history is a separate explicit action.
+- Switching the active project never retargets an existing draft or running job.
+
+#### Saved provider profiles
+
+- Provider profiles are global reusable records selected at job setup; a project may define a default profile and model, but each job can override them.
+- A profile has a stable ID, display name, provider/runtime kind, endpoint or deployment metadata, default model, capability/health snapshot, revision, and timestamps.
+- Persist only non-secret profile metadata in app configuration. Store API keys and tokens in the operating-system credential vault and refer to them by credential reference; secrets must not enter renderer state, settings JSON, events, or job artifacts.
+- Treat LM Studio, Ollama, and other user-managed endpoints as profiles with explicit loopback/LAN/remote egress classification. "Local" must not automatically mean offline or zero egress.
+- Connection tests and model discovery live on the Provider profiles page. Job setup selects a saved profile and exact model, with a link to manage profiles rather than editing endpoints or secrets inline.
+- Editing or deleting a profile does not rewrite old jobs. Draft jobs require re-selection and renewed approval when the referenced profile revision or model availability changes.
+
+#### Project skill catalog
+
+- Give every active project a dedicated Skills page with search and filters for applicability, supported mode, trust/certification, lifecycle state, and risk.
+- Show every discovered package, including invalid, duplicate, uncertified, stale, and not-applicable skills, with an explicit disabled reason rather than hiding it.
+- Skill discovery/source configuration is global, while applicability evidence and scan freshness are project-specific.
+- A skill card offers separate **View details** and **Start job** actions. Starting a job opens setup with the project and immutable skill digest already selected.
+- Applicability, context, and approvals become stale when the repository, workspace, skill digest, profile revision, or model changes and must be recomputed before launch.
+- Replace the single `planningSupported` presentation flag over time with explicit supported modes and certification evidence for the exact skill digest.
+
+#### Durable jobs and history
+
+- Clicking **Start job** immediately creates a durable `draft` job with a stable job ID and navigates to its workspace. Setup choices are autosaved so the user can leave and return before starting execution.
+- Keep the stable job ID separate from process/attempt IDs. Retrying after an interrupted provider turn creates another attempt; cloning with another provider/model creates a new linked job.
+- The same job workspace owns setup, preflight, plan, approvals, activity, execution, verification, result, summary, and artifacts.
+- Persist state/checkpoints before emitting renderer events. Store a versioned manifest, append-only event log, summaries, plans, patches, command logs, and other immutable artifacts in app-owned storage.
+- Successful, failed, cancelled, blocked, rejected-preflight, partial, and interrupted jobs all remain in history. On restart, reconstruct the workspace from persisted state rather than renderer memory.
+- Snapshot the canonical project/workspace, skill name and full digest, provider profile ID and revision, exact model, capability snapshot, run mode, context hash, approval envelope, and relevant limits into the job. Later project, skill, or profile edits must not change historical meaning.
+- Resume only from a proven safe checkpoint. Record `unknown_outcome` and require reconciliation when a crash leaves a possible write or command side effect uncertain.
+
+#### Plan, guided, and continuous modes
+
+Model the choice as two independent values:
+
+- `runMode: "plan" | "apply"` controls what the skill and engine are permitted to do;
+- `approvalMode: "guided" | "continuous"` controls whether an Apply job pauses after its persisted plan.
+
+Expose these as three clear user-facing choices:
+
+1. **Plan only** creates and saves a plan, then stops without target writes or project commands.
+2. **Guided job** creates a plan, pauses for task selection/approval, then executes and verifies the approved work.
+3. **Continuous job** still creates and persists the same internal plan, but continues automatically inside the capability envelope approved during setup.
+
+Continuous mode is not blanket permission. It must pause for any new or higher-risk capability, context/egress expansion, repository drift, secret detection, install or network request, conflict, deletion, publish action, or uncertain side effect. The current engine certifies only plan-only behavior, so Guided and Continuous Apply remain visibly disabled until guarded writes, structured commands, durable recovery, verification, and approval enforcement are implemented and certified.
+
 UX rules:
 
 - Always show whether the app is reading, sending, writing, executing, or waiting for approval.
@@ -489,6 +560,9 @@ UX rules:
 - A cancelled stream is not automatically a cancelled provider job; show the real cancellation state.
 - Preserve user decisions and partial artifacts through crashes or restarts.
 - Never make a successful model response look like a successful repository change.
+- Display why a skill, profile, model, or execution mode is unavailable and what action can resolve it.
+- Create drafts only from an explicit **Start job** action; viewing skill details must not create history entries.
+- Keep project, skill, provider/model, mode, and current job state visible throughout setup and execution.
 
 ## Delivery plan
 
@@ -715,4 +789,8 @@ If the goal is to reach a trustworthy beta quickly, use these defaults:
 2. **Implementation complete; release gate pending:** replace workspace/system runtime lookup with checksum-pinned packaged Node, agent-host, and Claude Code resources. The NSIS installer builds locally; a clean second-Windows-machine install plus live Claude and local-model runs still gate portability.
 3. **Complete:** implement the recursive `../skills/**/SKILL.md` catalog, including malformed/orphaned metadata visibility, package digests, inert scripts, path/link rejection, and configurable roots.
 4. **Implementation complete; live smoke pending:** build certified `migrate-to-vite` and `upgrade-react-router-to-v8` read-only adapters with canonical repository confirmation, applicability and exact context preview, explicit Claude egress approval, zero model tools, structured plan validation, and app-owned Markdown/JSON artifacts. The `logo` repository is the positive Router 5 fixture.
-5. **Next:** add durable state-machine history before enabling any target write or project command.
+5. **Next:** add versioned project and non-secret provider-profile persistence, OS credential-vault references, project switching, and the persistent application shell.
+6. Add a durable job store with stable job IDs, draft autosave, attempt IDs, state-machine checkpoints, append-only events, history list/detail APIs, restart recovery, and retention/deletion policy.
+7. Refactor the renderer into project Overview/Skills/Jobs pages plus global Provider profiles/Skill sources/Settings pages; move the existing certified plan-only workflow into the durable job workspace.
+8. Add renderer integration tests, Rust persistence/validation tests, history/recovery tests, and Tauri restart smoke tests for multiple projects and provider profiles.
+9. Only after those foundations are verified, implement and certify Guided Apply and Continuous Apply with guarded writes, structured commands, explicit capability enforcement, isolated workspaces, verification, and recovery. Do not route either mode to the current generic read-only agent command.
