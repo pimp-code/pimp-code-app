@@ -17,7 +17,7 @@ before(async () => {
     appType: "custom",
     plugins: [react()],
     optimizeDeps: { noDiscovery: true },
-    server: { middlewareMode: true },
+    server: { middlewareMode: true, hmr: false },
   });
   harness = await server.ssrLoadModule("/tests/project-management-harness.tsx");
 });

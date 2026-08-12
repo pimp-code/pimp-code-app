@@ -9,7 +9,7 @@
     "tauri": "tauri",
     "tauri:build": "tauri build",
     "tauri:dev": "tauri dev",
-    "test": "node --experimental-strip-types --test tests/application-settings.test.mjs tests/markdown-checklist.test.mjs tests/project-management.test.mjs",
+    "test": "node --experimental-strip-types --test --test-concurrency=1 tests/application-settings.test.mjs tests/desktop-shell.test.mjs tests/markdown-checklist.test.mjs tests/project-management.test.mjs",
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
@@ -24,6 +24,7 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",
+    "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
     "vite": "^8.2.1"
   }
