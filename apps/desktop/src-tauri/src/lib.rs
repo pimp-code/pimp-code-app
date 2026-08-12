@@ -18,10 +18,15 @@ use tokio::{
     time::{Duration, sleep},
 };
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
+mod credential_vault;
 mod jobs;
 mod settings;
 
+use credential_vault::{
+    CredentialVaultState, is_vault_reference_for_profile, validate_secret, vault_reference,
+};
 use jobs::{
     CreateJobRequest, JobProviderKind, JobRecord, JobStore, UpdateJobSetupRequest,
     apply_job_retention, attach_preflight, begin_attempt, create_job as create_job_record,
@@ -32,9 +37,9 @@ use jobs::{
 };
 use settings::{
     ApplicationSettings, ProjectSettings, ProjectUpdateInput, ProviderProfileInput,
-    ProviderProfileKind, ProviderProfileSettings, add_project, delete_provider_profile,
-    load_application_settings, load_projects, load_provider_profiles, remove_project,
-    save_application_settings as save_application_settings_record, save_projects,
+    ProviderProfileKind, ProviderProfileRecord, ProviderProfileSettings, add_project,
+    delete_provider_profile, load_application_settings, load_projects, load_provider_profiles,
+    remove_project, save_application_settings as save_application_settings_record, save_projects,
     save_provider_profiles, select_project, update_project, upsert_provider_profile,
 };
 
@@ -65,9 +70,11 @@ struct AgentStartRequest {
     prompt: String,
     max_turns: u8,
     provider: ProviderConfig,
+    #[serde(default)]
+    provider_profile_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum ProviderConfig {
     Claude { model: String },
@@ -103,6 +110,20 @@ struct UtilityResponse {
 #[serde(rename_all = "camelCase")]
 struct AgentStartResponse {
     run_id: String,
+}
+
+#[derive(Clone)]
+struct ResolvedCredential {
+    environment_key: &'static str,
+    secret: Arc<Zeroizing<String>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCredentialStatus {
+    profile_id: String,
+    source: &'static str,
+    configured: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -222,13 +243,11 @@ fn runtime_working_directory(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn minimal_environment() -> HashMap<String, String> {
-    const SAFE_KEYS: [&str; 14] = [
-        "ANTHROPIC_API_KEY",
+    const SAFE_KEYS: [&str; 12] = [
         "APPDATA",
         "COMSPEC",
         "HOME",
         "LOCALAPPDATA",
-        "LOCAL_LLM_API_KEY",
         "PATH",
         "PATHEXT",
         "SYSTEMDRIVE",
@@ -249,30 +268,7 @@ fn minimal_environment() -> HashMap<String, String> {
         .collect()
 }
 
-fn utility_environment(request: &Value) -> HashMap<String, String> {
-    let mut environment = minimal_environment();
-    let operation = request.get("operation").and_then(Value::as_str);
-    let provider_kind = request
-        .get("provider")
-        .and_then(Value::as_object)
-        .and_then(|provider| provider.get("kind"))
-        .and_then(Value::as_str);
-    match (operation, provider_kind) {
-        (Some("provider_health"), Some("claude")) => {
-            environment.remove("LOCAL_LLM_API_KEY");
-        }
-        (Some("provider_health"), Some("local")) => {
-            environment.remove("ANTHROPIC_API_KEY");
-        }
-        _ => {
-            environment.remove("ANTHROPIC_API_KEY");
-            environment.remove("LOCAL_LLM_API_KEY");
-        }
-    }
-    environment
-}
-
-fn sanitize_diagnostic(message: impl Into<String>) -> String {
+fn redact_host_credentials(message: impl Into<String>) -> String {
     let mut result = message.into();
     for key in ["ANTHROPIC_API_KEY", "LOCAL_LLM_API_KEY"] {
         if let Ok(secret) = std::env::var(key)
@@ -281,7 +277,56 @@ fn sanitize_diagnostic(message: impl Into<String>) -> String {
             result = result.replace(&secret, "[REDACTED]");
         }
     }
-    result.chars().take(4_000).collect()
+    result
+}
+
+fn sanitize_diagnostic(message: impl Into<String>) -> String {
+    redact_host_credentials(message)
+        .chars()
+        .take(4_000)
+        .collect()
+}
+
+fn sanitize_provider_text(
+    message: impl Into<String>,
+    credential: Option<&ResolvedCredential>,
+) -> String {
+    let mut result = redact_host_credentials(message);
+    if let Some(credential) = credential
+        && !credential.secret.is_empty()
+    {
+        result = result.replace(credential.secret.as_str(), "[REDACTED]");
+    }
+    result
+}
+
+fn sanitize_provider_diagnostic(
+    message: impl Into<String>,
+    credential: Option<&ResolvedCredential>,
+) -> String {
+    sanitize_provider_text(message, credential)
+        .chars()
+        .take(4_000)
+        .collect()
+}
+
+fn sanitize_provider_value(value: &mut Value, credential: Option<&ResolvedCredential>) {
+    match value {
+        Value::String(text) => {
+            *text = sanitize_provider_text(std::mem::take(text), credential);
+        }
+        Value::Array(values) => {
+            for value in values {
+                sanitize_provider_value(value, credential);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                sanitize_provider_value(value, credential);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_skill_roots(roots: Vec<String>) -> Result<Vec<String>, String> {
@@ -327,6 +372,104 @@ fn provider_profiles_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_config_dir()
         .map(|directory| directory.join("provider-profiles.json"))
         .map_err(|error| format!("Could not resolve app configuration directory: {error}"))
+}
+
+fn provider_environment_key(kind: ProviderProfileKind) -> &'static str {
+    match kind {
+        ProviderProfileKind::Claude => "ANTHROPIC_API_KEY",
+        ProviderProfileKind::Local => "LOCAL_LLM_API_KEY",
+    }
+}
+
+fn provider_profile(app: &AppHandle, profile_id: &str) -> Result<ProviderProfileRecord, String> {
+    load_provider_profiles(&provider_profiles_settings_path(app)?)?
+        .profiles
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| "The selected provider profile no longer exists".to_string())
+}
+
+fn validate_provider_config(
+    profile: &ProviderProfileRecord,
+    provider: &ProviderConfig,
+) -> Result<(), String> {
+    let matches = match (&profile.kind, provider) {
+        (ProviderProfileKind::Claude, ProviderConfig::Claude { .. }) => true,
+        (ProviderProfileKind::Local, ProviderConfig::Local { endpoint, .. }) => {
+            profile.endpoint.as_deref() == Some(endpoint.trim())
+        }
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err("The provider request does not match the selected profile".to_string())
+    }
+}
+
+fn update_profile_credential_reference(
+    settings: &mut ProviderProfileSettings,
+    profile_id: &str,
+    credential_ref: Option<String>,
+) -> Result<(), String> {
+    let profile = settings
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .cloned()
+        .ok_or_else(|| "The selected provider profile no longer exists".to_string())?;
+    upsert_provider_profile(
+        settings,
+        ProviderProfileInput {
+            id: Some(profile.id),
+            name: profile.name,
+            kind: profile.kind,
+            endpoint: profile.endpoint,
+            default_model: profile.default_model,
+            credential_ref,
+        },
+    )?;
+    Ok(())
+}
+
+async fn resolve_provider_credential(
+    app: &AppHandle,
+    vault: &CredentialVaultState,
+    profile_id: &str,
+    provider: &ProviderConfig,
+) -> Result<Option<ResolvedCredential>, String> {
+    let profile = provider_profile(app, profile_id)?;
+    validate_provider_config(&profile, provider)?;
+    let environment_key = provider_environment_key(profile.kind);
+    let Some(reference) = profile.credential_ref.as_deref() else {
+        return Ok(None);
+    };
+
+    let secret = if is_vault_reference_for_profile(reference, profile_id) {
+        vault
+            .get(profile_id.to_string())
+            .await?
+            .ok_or_else(|| "The selected profile's stored credential is unavailable".to_string())?
+    } else if let Some(key) = reference.strip_prefix("environment:") {
+        if key != environment_key {
+            return Err("The profile credential reference does not match its provider".to_string());
+        }
+        let Ok(secret) = std::env::var(key) else {
+            return Ok(None);
+        };
+        if secret.is_empty() {
+            return Ok(None);
+        }
+        validate_secret(&secret)?;
+        Zeroizing::new(secret)
+    } else {
+        return Err("The profile credential reference is unsupported".to_string());
+    };
+
+    Ok(Some(ResolvedCredential {
+        environment_key,
+        secret: Arc::new(secret),
+    }))
 }
 
 fn application_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -474,20 +617,226 @@ fn list_provider_profiles(app: AppHandle) -> Result<ProviderProfileSettings, Str
 }
 
 #[tauri::command]
-fn save_provider_profile(
+async fn save_provider_profile(
     app: AppHandle,
-    profile: ProviderProfileInput,
+    vault: State<'_, CredentialVaultState>,
+    mut profile: ProviderProfileInput,
 ) -> Result<ProviderProfileSettings, String> {
     let settings_path = provider_profiles_settings_path(&app)?;
     let mut settings = load_provider_profiles(&settings_path)?;
+    let existing = profile.id.as_deref().and_then(|profile_id| {
+        settings
+            .profiles
+            .iter()
+            .find(|stored| stored.id == profile_id)
+            .cloned()
+    });
+    if let Some(reference) = profile.credential_ref.as_deref() {
+        if let Some(key) = reference.strip_prefix("environment:") {
+            if key != provider_environment_key(profile.kind) {
+                return Err(
+                    "The profile credential reference does not match its provider".to_string(),
+                );
+            }
+        } else if reference.starts_with("vault:provider:") {
+            let profile_id = profile.id.as_deref().ok_or_else(|| {
+                "A new profile cannot reference a credential before it is saved".to_string()
+            })?;
+            if !is_vault_reference_for_profile(reference, profile_id) {
+                return Err(
+                    "The profile credential reference points to another profile".to_string()
+                );
+            }
+            if existing
+                .as_ref()
+                .and_then(|stored| stored.credential_ref.as_deref())
+                != Some(reference)
+            {
+                return Err(
+                    "Use the dedicated credential command to create a vault reference".to_string(),
+                );
+            }
+        } else {
+            return Err("The profile credential reference is unsupported".to_string());
+        }
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|stored| stored.kind != profile.kind)
+        && existing.as_ref().is_some_and(|stored| {
+            stored
+                .credential_ref
+                .as_deref()
+                .is_some_and(|reference| is_vault_reference_for_profile(reference, &stored.id))
+        })
+    {
+        profile.credential_ref = None;
+    }
     upsert_provider_profile(&mut settings, profile)?;
-    save_provider_profiles(&settings_path, &settings)?;
+    let vault_profile_id = existing.as_ref().and_then(|stored| {
+        stored
+            .credential_ref
+            .as_deref()
+            .filter(|reference| is_vault_reference_for_profile(reference, &stored.id))
+            .and_then(|old_reference| {
+                settings
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == stored.id)
+                    .filter(|profile| profile.credential_ref.as_deref() != Some(old_reference))
+                    .map(|_| stored.id.clone())
+            })
+    });
+    let previous = if let Some(profile_id) = vault_profile_id.as_ref() {
+        let secret = vault.get(profile_id.clone()).await?;
+        vault.delete(profile_id.clone()).await?;
+        secret
+    } else {
+        None
+    };
+    if let Err(error) = save_provider_profiles(&settings_path, &settings) {
+        let rollback = if let Some(profile_id) = vault_profile_id.as_deref() {
+            restore_vault_credential(&vault, profile_id, previous).await
+        } else {
+            Ok(())
+        };
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback_error) => {
+                format!("{error}; additionally, the credential rollback failed: {rollback_error}")
+            }
+        });
+    }
     Ok(settings)
 }
 
 #[tauri::command]
-fn delete_saved_provider_profile(
+async fn provider_credential_status(
     app: AppHandle,
+    vault: State<'_, CredentialVaultState>,
+    profile_id: String,
+) -> Result<ProviderCredentialStatus, String> {
+    let profile = provider_profile(&app, &profile_id)?;
+    let expected_environment_key = provider_environment_key(profile.kind);
+    match profile.credential_ref.as_deref() {
+        Some(reference) if is_vault_reference_for_profile(reference, &profile_id) => {
+            Ok(ProviderCredentialStatus {
+                profile_id: profile_id.clone(),
+                source: "windowsVault",
+                configured: vault.get(profile_id).await?.is_some(),
+            })
+        }
+        Some(reference) if reference.starts_with("vault:provider:") => {
+            Err("The profile credential reference points to another profile".to_string())
+        }
+        Some(reference) if reference.starts_with("environment:") => {
+            let key = reference.trim_start_matches("environment:");
+            if key != expected_environment_key {
+                return Err(
+                    "The profile credential reference does not match its provider".to_string(),
+                );
+            }
+            Ok(ProviderCredentialStatus {
+                profile_id,
+                source: "environment",
+                configured: std::env::var(key).is_ok_and(|secret| !secret.is_empty()),
+            })
+        }
+        Some(_) => Err("The profile credential reference is unsupported".to_string()),
+        None => Ok(ProviderCredentialStatus {
+            profile_id,
+            source: "none",
+            configured: false,
+        }),
+    }
+}
+
+async fn restore_vault_credential(
+    vault: &CredentialVaultState,
+    profile_id: &str,
+    previous: Option<Zeroizing<String>>,
+) -> Result<(), String> {
+    match previous {
+        Some(secret) => vault.set(profile_id.to_string(), secret.to_string()).await,
+        None => vault.delete(profile_id.to_string()).await,
+    }
+}
+
+#[tauri::command]
+async fn save_provider_credential(
+    app: AppHandle,
+    vault: State<'_, CredentialVaultState>,
+    profile_id: String,
+    secret: String,
+) -> Result<ProviderProfileSettings, String> {
+    validate_secret(&secret)?;
+    let settings_path = provider_profiles_settings_path(&app)?;
+    let mut settings = load_provider_profiles(&settings_path)?;
+    update_profile_credential_reference(
+        &mut settings,
+        &profile_id,
+        Some(vault_reference(&profile_id)?),
+    )?;
+    let previous = vault.get(profile_id.clone()).await?;
+    vault.set(profile_id.clone(), secret).await?;
+    if let Err(error) = save_provider_profiles(&settings_path, &settings) {
+        let rollback = restore_vault_credential(&vault, &profile_id, previous).await;
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback_error) => {
+                format!("{error}; additionally, the credential rollback failed: {rollback_error}")
+            }
+        });
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn delete_provider_credential(
+    app: AppHandle,
+    vault: State<'_, CredentialVaultState>,
+    profile_id: String,
+) -> Result<ProviderProfileSettings, String> {
+    let settings_path = provider_profiles_settings_path(&app)?;
+    let mut settings = load_provider_profiles(&settings_path)?;
+    let profile = settings
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .cloned()
+        .ok_or_else(|| "The selected provider profile no longer exists".to_string())?;
+    update_profile_credential_reference(&mut settings, &profile_id, None)?;
+    let was_vault_backed = profile
+        .credential_ref
+        .as_deref()
+        .is_some_and(|reference| is_vault_reference_for_profile(reference, &profile_id));
+    let previous = if was_vault_backed {
+        let secret = vault.get(profile_id.clone()).await?;
+        vault.delete(profile_id.clone()).await?;
+        secret
+    } else {
+        None
+    };
+    if let Err(error) = save_provider_profiles(&settings_path, &settings) {
+        let rollback = if was_vault_backed {
+            restore_vault_credential(&vault, &profile_id, previous).await
+        } else {
+            Ok(())
+        };
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback_error) => {
+                format!("{error}; additionally, the credential rollback failed: {rollback_error}")
+            }
+        });
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn delete_saved_provider_profile(
+    app: AppHandle,
+    vault: State<'_, CredentialVaultState>,
     profile_id: String,
 ) -> Result<ProviderProfileSettings, String> {
     let projects = load_projects(&project_settings_path(&app)?)?;
@@ -503,8 +852,37 @@ fn delete_saved_provider_profile(
     }
     let settings_path = provider_profiles_settings_path(&app)?;
     let mut settings = load_provider_profiles(&settings_path)?;
+    let profile = settings
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .cloned()
+        .ok_or_else(|| "Provider profile was not found".to_string())?;
+    let was_vault_backed = profile
+        .credential_ref
+        .as_deref()
+        .is_some_and(|reference| is_vault_reference_for_profile(reference, &profile_id));
+    let previous = if was_vault_backed {
+        let secret = vault.get(profile_id.clone()).await?;
+        vault.delete(profile_id.clone()).await?;
+        secret
+    } else {
+        None
+    };
     delete_provider_profile(&mut settings, &profile_id)?;
-    save_provider_profiles(&settings_path, &settings)?;
+    if let Err(error) = save_provider_profiles(&settings_path, &settings) {
+        let rollback = if was_vault_backed {
+            restore_vault_credential(&vault, &profile_id, previous).await
+        } else {
+            Ok(())
+        };
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback_error) => {
+                format!("{error}; additionally, the credential rollback failed: {rollback_error}")
+            }
+        });
+    }
     Ok(settings)
 }
 
@@ -629,7 +1007,11 @@ fn delete_saved_job(app: AppHandle, job_id: String) -> Result<JobStore, String> 
     load_jobs(&root)
 }
 
-async fn run_agent_utility(app: &AppHandle, request: Value) -> Result<Value, String> {
+async fn run_agent_utility(
+    app: &AppHandle,
+    request: Value,
+    credential: Option<ResolvedCredential>,
+) -> Result<Value, String> {
     let utility_script = utility_script_path(app)?;
     let node_runtime = node_runtime_path(app)?;
     let runtime_directory = runtime_working_directory(app)?;
@@ -638,11 +1020,14 @@ async fn run_agent_utility(app: &AppHandle, request: Value) -> Result<Value, Str
         .arg(utility_script)
         .current_dir(runtime_directory)
         .env_clear()
-        .envs(utility_environment(&request))
+        .envs(minimal_environment())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(credential) = credential.as_ref() {
+        command.env(credential.environment_key, credential.secret.as_str());
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start the agent utility: {error}"))?;
@@ -668,23 +1053,32 @@ async fn run_agent_utility(app: &AppHandle, request: Value) -> Result<Value, Str
         return Err("Agent utility output exceeded the size limit".to_string());
     }
     if !output.status.success() {
-        let detail = sanitize_diagnostic(String::from_utf8_lossy(&output.stderr));
+        let detail = sanitize_provider_diagnostic(
+            String::from_utf8_lossy(&output.stderr),
+            credential.as_ref(),
+        );
         return Err(if detail.trim().is_empty() {
             format!("Agent utility exited with {}", output.status)
         } else {
             format!("Agent utility failed: {}", detail.trim())
         });
     }
-    let response: UtilityResponse = serde_json::from_slice(&output.stdout)
+    let mut response: UtilityResponse = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Agent utility returned invalid JSON: {error}"))?;
     if !response.ok {
-        return Err(sanitize_diagnostic(response.error.unwrap_or_else(|| {
-            "Agent utility failed without details".to_string()
-        })));
+        return Err(sanitize_provider_diagnostic(
+            response
+                .error
+                .unwrap_or_else(|| "Agent utility failed without details".to_string()),
+            credential.as_ref(),
+        ));
     }
-    response
+    let mut data = response
         .data
-        .ok_or_else(|| "Agent utility returned no data".to_string())
+        .take()
+        .ok_or_else(|| "Agent utility returned no data".to_string())?;
+    sanitize_provider_value(&mut data, credential.as_ref());
+    Ok(data)
 }
 
 #[tauri::command]
@@ -696,18 +1090,26 @@ async fn scan_skill_catalog(app: AppHandle, roots: Vec<String>) -> Result<Value,
             "operation": "scan_skill_catalog",
             "roots": roots,
         }),
+        None,
     )
     .await
 }
 
 #[tauri::command]
-async fn provider_health(app: AppHandle, provider: ProviderConfig) -> Result<Value, String> {
+async fn provider_health(
+    app: AppHandle,
+    vault: State<'_, CredentialVaultState>,
+    profile_id: String,
+    provider: ProviderConfig,
+) -> Result<Value, String> {
+    let credential = resolve_provider_credential(&app, &vault, &profile_id, &provider).await?;
     run_agent_utility(
         &app,
         json!({
             "operation": "provider_health",
             "provider": provider,
         }),
+        credential,
     )
     .await
 }
@@ -774,7 +1176,7 @@ async fn prepare_plan(
         &configured_roots,
         &preflight_root,
     );
-    let preflight = run_agent_utility(&app, request).await?;
+    let preflight = run_agent_utility(&app, request, None).await?;
     if let Some(job_id) = job_id {
         attach_preflight(&job_storage_root(&app)?, &job_id, &preflight)?;
     }
@@ -926,6 +1328,7 @@ async fn spawn_agent_host(
     state: State<'_, AgentProcessState>,
     run_id: String,
     start_message: Value,
+    credential: Option<ResolvedCredential>,
     job_id: Option<String>,
 ) -> Result<AgentStartResponse, String> {
     let mut active_guard = state.active.lock().await;
@@ -947,6 +1350,9 @@ async fn spawn_agent_host(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(credential) = credential.as_ref() {
+        command.env(credential.environment_key, credential.secret.as_str());
+    }
     if let Some(path) = claude_runtime {
         command.env("PIMP_CLAUDE_CODE_PATH", path);
     }
@@ -991,6 +1397,7 @@ async fn spawn_agent_host(
     let stdout_app = app.clone();
     let stdout_run_id = run_id.clone();
     let stdout_job_id = job_id.clone();
+    let stdout_credential = credential.clone();
     let terminal_result_seen = Arc::new(AtomicBool::new(false));
     let stdout_terminal_result_seen = terminal_result_seen.clone();
     let stdout_task = tauri::async_runtime::spawn(async move {
@@ -1008,7 +1415,8 @@ async fn spawn_agent_host(
                     .map_err(|error| error.to_string())
                     .and_then(|event| validate_agent_event(event, &stdout_run_id))
                 {
-                    Ok(event) => {
+                    Ok(mut event) => {
+                        sanitize_provider_value(&mut event, stdout_credential.as_ref());
                         if event.get("type").and_then(Value::as_str) == Some("result") {
                             stdout_terminal_result_seen.store(true, Ordering::Release);
                         }
@@ -1040,6 +1448,7 @@ async fn spawn_agent_host(
     let stderr_app = app.clone();
     let stderr_run_id = run_id.clone();
     let stderr_job_id = job_id.clone();
+    let stderr_credential = credential;
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -1048,7 +1457,7 @@ async fn spawn_agent_host(
                     &stderr_app,
                     &stderr_run_id,
                     "warning",
-                    line,
+                    sanitize_provider_text(line, stderr_credential.as_ref()),
                     stderr_job_id.as_deref(),
                 );
             }
@@ -1084,6 +1493,7 @@ async fn spawn_agent_host(
 async fn start_agent(
     app: AppHandle,
     state: State<'_, AgentProcessState>,
+    vault: State<'_, CredentialVaultState>,
     request: AgentStartRequest,
 ) -> Result<AgentStartResponse, String> {
     if request.cwd.trim().is_empty() || request.prompt.trim().is_empty() {
@@ -1092,6 +1502,12 @@ async fn start_agent(
     if !(1..=20).contains(&request.max_turns) {
         return Err("maxTurns must be between 1 and 20".to_string());
     }
+    let credential = match request.provider_profile_id.as_deref() {
+        Some(profile_id) => {
+            resolve_provider_credential(&app, &vault, profile_id, &request.provider).await?
+        }
+        None => None,
+    };
 
     let run_id = Uuid::new_v4().to_string();
     let start_message = json!({
@@ -1103,13 +1519,14 @@ async fn start_agent(
         "provider": request.provider,
     });
 
-    spawn_agent_host(app, state, run_id, start_message, None).await
+    spawn_agent_host(app, state, run_id, start_message, credential, None).await
 }
 
 #[tauri::command]
 async fn start_plan(
     app: AppHandle,
     state: State<'_, AgentProcessState>,
+    vault: State<'_, CredentialVaultState>,
     request: PlanStartRequest,
 ) -> Result<AgentStartResponse, String> {
     let parsed_preflight_id = Uuid::parse_str(request.preflight_id.trim())
@@ -1150,6 +1567,20 @@ async fn start_plan(
 
     let run_id = Uuid::new_v4().to_string();
     let jobs_root = job_storage_root(&app)?;
+    let provider_snapshot = load_jobs(&jobs_root)?
+        .jobs
+        .into_iter()
+        .find(|job| job.id == request.job_id)
+        .and_then(|job| job.provider)
+        .ok_or_else(|| "Job does not have a provider snapshot".to_string())?;
+    validate_job_provider_snapshot(&app, &provider_snapshot)?;
+    let credential = resolve_provider_credential(
+        &app,
+        &vault,
+        &provider_snapshot.profile_id,
+        &request.provider,
+    )
+    .await?;
     begin_attempt(
         &jobs_root,
         &request.job_id,
@@ -1173,6 +1604,7 @@ async fn start_plan(
         state,
         run_id.clone(),
         start_message,
+        credential,
         Some(job_id.clone()),
     )
     .await
@@ -1261,8 +1693,11 @@ async fn agent_status(state: State<'_, AgentProcessState>) -> Result<Option<Stri
 }
 
 pub fn run() {
+    let credential_vault = CredentialVaultState::native()
+        .expect("the operating-system credential vault must be available");
     tauri::Builder::default()
         .manage(AgentProcessState::default())
+        .manage(credential_vault)
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_skill_roots,
@@ -1274,6 +1709,9 @@ pub fn run() {
             update_saved_project,
             list_provider_profiles,
             save_provider_profile,
+            provider_credential_status,
+            save_provider_credential,
+            delete_provider_credential,
             delete_saved_provider_profile,
             list_application_settings,
             save_application_settings,
@@ -1298,9 +1736,16 @@ pub fn run() {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::{node_compatible_path, prepare_plan_utility_request};
+    use super::{
+        ResolvedCredential, minimal_environment, node_compatible_path,
+        prepare_plan_utility_request, sanitize_provider_value,
+    };
     use serde_json::json;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+    use zeroize::Zeroizing;
 
     #[test]
     fn converts_windows_verbatim_paths_for_node() {
@@ -1337,5 +1782,29 @@ mod tests {
         assert_eq!(request["skillRoot"], r"C:\workspace\skills");
         assert_eq!(request["configuredRoots"], json!(configured_roots));
         assert_eq!(request["preflightRoot"], r"C:\app-data\preflights");
+    }
+
+    #[test]
+    fn base_child_environment_excludes_all_provider_credentials() {
+        let environment = minimal_environment();
+        assert!(!environment.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!environment.contains_key("LOCAL_LLM_API_KEY"));
+    }
+
+    #[test]
+    fn provider_output_redaction_preserves_non_secret_payloads() {
+        let credential = ResolvedCredential {
+            environment_key: "LOCAL_LLM_API_KEY",
+            secret: Arc::new(Zeroizing::new("vault-secret-fixture".to_string())),
+        };
+        let mut value = json!({
+            "result": format!("{}vault-secret-fixture-tail", "a".repeat(5_000)),
+            "nested": ["vault-secret-fixture"]
+        });
+        sanitize_provider_value(&mut value, Some(&credential));
+        let result = value["result"].as_str().expect("redacted result");
+        assert!(result.ends_with("[REDACTED]-tail"));
+        assert!(result.len() > 5_000);
+        assert_eq!(value["nested"][0], "[REDACTED]");
     }
 }

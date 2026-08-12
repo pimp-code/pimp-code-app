@@ -112,6 +112,7 @@ function createHost() {
       },
     },
     jobs: { version: 1, jobs: [] },
+    credentialProfileIds: new Set(),
   };
   const calls = [];
   return {
@@ -132,6 +133,28 @@ function createHost() {
           return [];
         case "agent_status":
           return null;
+        case "provider_credential_status": {
+          const profile = state.profiles.profiles.find(
+            (item) => item.id === args.profileId,
+          );
+          const vaultBacked = profile?.credentialRef?.startsWith("vault:provider:");
+          return {
+            profileId: args.profileId,
+            source: vaultBacked ? "windowsVault" : "environment",
+            configured:
+              vaultBacked && state.credentialProfileIds.has(args.profileId),
+          };
+        }
+        case "save_provider_credential": {
+          const profile = state.profiles.profiles.find(
+            (item) => item.id === args.profileId,
+          );
+          if (!profile) throw new Error("Profile not found");
+          profile.credentialRef = `vault:provider:${profile.id}`;
+          profile.revision += 1;
+          state.credentialProfileIds.add(profile.id);
+          return structuredClone(state.profiles);
+        }
         case "select_saved_project":
           state.projects.activeProjectId = args.projectId;
           return structuredClone(state.projects);
@@ -205,6 +228,18 @@ async function click(element) {
   assert.ok(element, "expected an interactive element");
   await harness.runAct(async () => {
     element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+}
+
+async function enter(input, value) {
+  assert.ok(input instanceof HTMLInputElement, "expected an input element");
+  await harness.runAct(async () => {
+    const setter = Object.getOwnPropertyDescriptor(
+      dom.window.HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
 
@@ -312,4 +347,30 @@ test("navigates to Settings and persists an enabled retention policy", async () 
   assert.equal(saved.args.settings.jobRetention.maxTerminalJobs, 500);
   assert.equal(saved.args.settings.jobRetention.maxAgeDays, 365);
   assert.match(document.body.textContent, /Retention settings saved\./u);
+});
+
+test("stores a profile credential through the vault boundary and clears the input", async () => {
+  await click(button("LLM profiles"));
+  await settle(
+    () => document.body.textContent.includes("Profile credential"),
+    "provider credential surface did not open",
+  );
+  const input = document.getElementById("profile-credential");
+  await enter(input, "desktop-test-secret");
+  await click(button("Save to Windows vault"));
+  await settle(
+    () => host.calls.some((call) => call.command === "save_provider_credential"),
+    "credential was not submitted to the trusted host",
+  );
+  assert.equal(input.value, "");
+  assert.doesNotMatch(document.body.textContent, /desktop-test-secret/u);
+  const saved = host.calls.findLast(
+    (call) => call.command === "save_provider_credential",
+  );
+  assert.equal(saved.args.profileId, host.state.profiles.profiles[0].id);
+  assert.equal(saved.args.secret, "desktop-test-secret");
+  await settle(
+    () => document.body.textContent.includes("Stored in Windows vault"),
+    "vault-backed status was not refreshed",
+  );
 });

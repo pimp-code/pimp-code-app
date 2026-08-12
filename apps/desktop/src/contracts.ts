@@ -77,6 +77,12 @@ export interface ProviderProfileSettings {
   profiles: ProviderProfileRecord[];
 }
 
+export interface ProviderCredentialStatus {
+  profileId: string;
+  source: "windowsVault" | "environment" | "none";
+  configured: boolean;
+}
+
 export type JobRunMode = "plan" | "apply";
 export type JobApprovalMode = "guided" | "continuous";
 export type JobStatus =
@@ -456,6 +462,21 @@ export function normalizeProviderProfileSettings(
         };
       })
       .filter((profile) => profile.id && profile.defaultModel),
+  };
+}
+
+export function normalizeProviderCredentialStatus(
+  value: unknown,
+): ProviderCredentialStatus {
+  const status = asRecord(value);
+  const source = status.source;
+  return {
+    profileId: asString(at(status, "profileId", "profile_id")),
+    source:
+      source === "windowsVault" || source === "environment"
+        ? source
+        : "none",
+    configured: status.configured === true,
   };
 }
 

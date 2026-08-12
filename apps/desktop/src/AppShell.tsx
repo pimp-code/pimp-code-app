@@ -1,10 +1,11 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   ApplicationSettings,
   JobRecord,
   ProjectRecord,
   ProjectSettings,
   ProjectUpdateInput,
+  ProviderCredentialStatus,
   ProviderKind,
   ProviderProfileInput,
   ProviderProfileRecord,
@@ -756,10 +757,13 @@ export function ProjectsPage({
 interface ProviderProfilesPageProps {
   profiles: ProviderProfileRecord[];
   selectedProfileId: string;
+  credentialStatus?: ProviderCredentialStatus;
   busy: boolean;
   onSelect: (profileId: string) => void;
   onSave: (input: ProviderProfileInput) => void;
   onDelete: (profileId: string) => void;
+  onSaveCredential: (profileId: string, secret: string) => void;
+  onDeleteCredential: (profileId: string) => void;
 }
 
 const EMPTY_PROFILE: ProviderProfileInput = {
@@ -773,14 +777,19 @@ const EMPTY_PROFILE: ProviderProfileInput = {
 export function ProviderProfilesPage({
   profiles,
   selectedProfileId,
+  credentialStatus,
   busy,
   onSelect,
   onSave,
   onDelete,
+  onSaveCredential,
+  onDeleteCredential,
 }: ProviderProfilesPageProps) {
   const [form, setForm] = useState<ProviderProfileInput>(EMPTY_PROFILE);
+  const credentialInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    if (credentialInput.current) credentialInput.current.value = "";
     const selected = profiles.find((profile) => profile.id === selectedProfileId);
     if (!selected) {
       setForm((current) =>
@@ -830,6 +839,27 @@ export function ProviderProfilesPage({
     form.name.trim().length > 0 &&
     form.defaultModel.trim().length > 0 &&
     (form.kind === "claude" || Boolean(form.endpoint?.trim()));
+  const currentCredentialStatus =
+    credentialStatus?.profileId === form.id ? credentialStatus : undefined;
+  const credentialLabel = !currentCredentialStatus
+    ? "Checking status..."
+    : currentCredentialStatus.source === "windowsVault"
+      ? currentCredentialStatus.configured
+        ? "Stored in Windows vault"
+        : "Vault entry unavailable"
+      : currentCredentialStatus.source === "environment"
+        ? currentCredentialStatus.configured
+          ? "Available from environment"
+          : "Environment key missing"
+        : "Not configured";
+
+  const submitCredential = () => {
+    const input = credentialInput.current;
+    const submitted = input?.value ?? "";
+    if (!form.id || !input || !submitted) return;
+    input.value = "";
+    onSaveCredential(form.id, submitted);
+  };
 
   return (
     <main className="management-page provider-page">
@@ -937,11 +967,54 @@ export function ProviderProfilesPage({
           </label>
 
           <div className="credential-note">
-            <strong>Credentials are not stored here</strong>
+            <div className="credential-status-row">
+              <strong>Profile credential</strong>
+              <span
+                className={currentCredentialStatus?.configured ? "configured" : ""}
+              >
+                {form.id ? credentialLabel : "Save the profile first"}
+              </span>
+            </div>
             <p>
-              This profile stores only a credential reference. The current runtime resolves
-              <code>{form.credentialRef}</code> from the trusted host environment; OS-vault secret entry is a separate implementation step.
+              Secrets are stored under this profile in Windows Credential Manager. Only the
+              selected provider receives its credential in the trusted child-process environment.
             </p>
+            {form.id ? (
+              <div className="credential-entry">
+                <label className="field" htmlFor="profile-credential">
+                  <span>Replace credential</span>
+                  <input
+                    id="profile-credential"
+                    ref={credentialInput}
+                    type="password"
+                    autoComplete="new-password"
+                    spellCheck={false}
+                    placeholder="Paste API key"
+                    disabled={busy}
+                  />
+                </label>
+                <div className="credential-actions">
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={submitCredential}
+                    disabled={busy}
+                  >
+                    Save to Windows vault
+                  </button>
+                  {currentCredentialStatus && currentCredentialStatus.source !== "none" ? (
+                    <button
+                      type="button"
+                      className="text-button danger-text"
+                      onClick={() => onDeleteCredential(form.id!)}
+                      disabled={busy}
+                    >
+                      Remove credential
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <button

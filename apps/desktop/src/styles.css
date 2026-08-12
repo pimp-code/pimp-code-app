@@ -853,6 +853,24 @@ p {
   font-size: 11px;
 }
 
+.credential-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.credential-status-row > span {
+  color: #d29a76;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.credential-status-row > span.configured {
+  color: #7fc49a;
+}
+
 .credential-note p {
   margin: 5px 0 0;
   font-size: 10px;
@@ -1315,6 +1333,24 @@ p {
 .job-detail-heading h2 {
   margin: 0;
   font-size: 20px;
+}
+
+.credential-entry {
+  display: grid;
+  gap: 10px;
+  margin-top: 13px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line-subtle);
+}
+
+.credential-entry .field {
+  gap: 6px;
+}
+
+.credential-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .job-detail-actions {

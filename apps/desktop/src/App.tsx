@@ -30,6 +30,7 @@ import {
   type ProjectSettings,
   type ProjectUpdateInput,
   type ProviderConfig,
+  type ProviderCredentialStatus,
   type ProviderHealth,
   type ProviderKind,
   type ProviderProfileInput,
@@ -48,6 +49,7 @@ import {
   normalizeJobStore,
   normalizeProjectSettings,
   normalizeProviderHealth,
+  normalizeProviderCredentialStatus,
   normalizeProviderProfileSettings,
   normalizeSkillCatalog,
   shortDigest,
@@ -212,6 +214,8 @@ export function App() {
   });
   const [providerProfiles, setProviderProfiles] =
     useState<ProviderProfileSettings>({ version: 1, profiles: [] });
+  const [providerCredentialStatus, setProviderCredentialStatus] =
+    useState<ProviderCredentialStatus>();
   const [applicationSettings, setApplicationSettings] =
     useState<ApplicationSettings>({
       version: 1,
@@ -256,6 +260,26 @@ export function App() {
   const sequence = useRef(0);
   const preflightRevision = useRef(0);
   const providerHealthRevision = useRef(0);
+  const providerCredentialStatusRevision = useRef(0);
+
+  const refreshProviderCredentialStatus = useCallback(async (profileId: string) => {
+    const revision = providerCredentialStatusRevision.current + 1;
+    providerCredentialStatusRevision.current = revision;
+    setProviderCredentialStatus(undefined);
+    if (!profileId) return;
+    try {
+      const value = await invoke<unknown>("provider_credential_status", {
+        profileId,
+      });
+      if (revision !== providerCredentialStatusRevision.current) return;
+      const status = normalizeProviderCredentialStatus(value);
+      if (status.profileId === profileId) setProviderCredentialStatus(status);
+    } catch (error) {
+      if (revision === providerCredentialStatusRevision.current) {
+        setNotice({ tone: "error", message: errorMessage(error) });
+      }
+    }
+  }, []);
 
   const selectedSkill = useMemo(
     () => catalog?.entries.find((entry) => entry.id === selectedSkillId),
@@ -277,6 +301,10 @@ export function App() {
       ),
     [providerProfiles, selectedProviderProfileId],
   );
+
+  useEffect(() => {
+    void refreshProviderCredentialStatus(selectedProviderProfileId);
+  }, [refreshProviderCredentialStatus, selectedProviderProfileId]);
 
   const activeJob = useMemo(
     () => jobs.jobs.find((job) => job.id === activeJobId),
@@ -976,6 +1004,53 @@ export function App() {
     }
   };
 
+  const saveProviderCredential = (profileId: string, secret: string) => {
+    setSavingSettings(true);
+    void invoke<unknown>("save_provider_credential", {
+      profileId,
+      secret,
+    })
+      .then(async (value) => {
+        const nextProfiles = normalizeProviderProfileSettings(value);
+        setProviderProfiles(nextProfiles);
+        activateProviderProfile(
+          nextProfiles.profiles.find((profile) => profile.id === profileId),
+        );
+        await refreshProviderCredentialStatus(profileId);
+        setNotice({
+          tone: "success",
+          message: "Credential saved in Windows Credential Manager.",
+        });
+      })
+      .catch((error: unknown) => {
+        setNotice({ tone: "error", message: errorMessage(error) });
+      })
+      .finally(() => {
+        setSavingSettings(false);
+      });
+  };
+
+  const deleteProviderCredential = async (profileId: string) => {
+    if (!window.confirm("Remove this profile credential?")) return;
+    setSavingSettings(true);
+    try {
+      const value = await invoke<unknown>("delete_provider_credential", {
+        profileId,
+      });
+      const nextProfiles = normalizeProviderProfileSettings(value);
+      setProviderProfiles(nextProfiles);
+      activateProviderProfile(
+        nextProfiles.profiles.find((profile) => profile.id === profileId),
+      );
+      await refreshProviderCredentialStatus(profileId);
+      setNotice({ tone: "success", message: "Profile credential removed." });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
   const deleteSavedJob = async (jobId: string) => {
     const job = jobs.jobs.find((item) => item.id === jobId);
     if (
@@ -1129,7 +1204,10 @@ export function App() {
     const revision = providerHealthRevision.current + 1;
     providerHealthRevision.current = revision;
     try {
-      const rawHealth = await invoke<unknown>("provider_health", { provider });
+      const rawHealth = await invoke<unknown>("provider_health", {
+        profileId: selectedProviderProfile?.id,
+        provider,
+      });
       if (revision !== providerHealthRevision.current) return;
       const health = normalizeProviderHealth(rawHealth);
       setProviderHealth(health);
@@ -1321,10 +1399,13 @@ export function App() {
         <ProviderProfilesPage
           profiles={providerProfiles.profiles}
           selectedProfileId={selectedProviderProfileId}
+          credentialStatus={providerCredentialStatus}
           busy={loadingSettings || savingSettings}
           onSelect={selectProviderProfile}
           onSave={saveProviderProfile}
           onDelete={deleteProviderProfile}
+          onSaveCredential={saveProviderCredential}
+          onDeleteCredential={deleteProviderCredential}
         />
       ) : (
     <main className="shell">
