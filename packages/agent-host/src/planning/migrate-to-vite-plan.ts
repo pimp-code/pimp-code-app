@@ -1099,6 +1099,21 @@ export function renderMigrateToVitePlanMarkdown(
     `- Entry points: ${plan.inventory.entryPoints.length > 0 ? plan.inventory.entryPoints.map(code).join(", ") : "None confirmed"}`,
     `- Environment variable names: ${plan.inventory.environmentVariableNames.length > 0 ? plan.inventory.environmentVariableNames.map(code).join(", ") : "None inventoried"}`,
     "",
+    "## Work checklist",
+    "",
+  );
+  if (plan.changes.length === 0 && plan.verification.length === 0) {
+    lines.push("No executable work is proposed.", "");
+  }
+  for (const change of plan.changes) {
+    lines.push(`- [ ] ${code(`change:${change.id}`)} - ${markdownText(change.title)}`);
+  }
+  for (const verification of plan.verification) {
+    lines.push(`- [ ] ${code(`verify:${verification.id}`)} - ${markdownText(verification.title)}`);
+  }
+
+  lines.push(
+    "",
     "## Parity checklist",
     "",
   );

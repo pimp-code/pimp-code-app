@@ -11,13 +11,16 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   AppShell,
   JobsPage,
+  OverviewPage,
   ProjectsPage,
   ProviderProfilesPage,
+  SettingsPage,
   SkillsPage,
   type AppView,
 } from "./AppShell";
 import {
   type AgentEvent,
+  type ApplicationSettings,
   type CatalogIssue,
   type DetailNote,
   type JobProviderSnapshot,
@@ -25,6 +28,7 @@ import {
   type JobStore,
   type PlanPreflight,
   type ProjectSettings,
+  type ProjectUpdateInput,
   type ProviderConfig,
   type ProviderHealth,
   type ProviderKind,
@@ -40,6 +44,7 @@ import {
   errorMessage,
   formatBytes,
   normalizePreflight,
+  normalizeApplicationSettings,
   normalizeJobStore,
   normalizeProjectSettings,
   normalizeProviderHealth,
@@ -47,6 +52,7 @@ import {
   normalizeSkillCatalog,
   shortDigest,
 } from "./contracts";
+import { MarkdownChecklist } from "./MarkdownChecklist";
 
 interface TimelineItem {
   id: number;
@@ -199,13 +205,22 @@ function jobSetupMatches(
 }
 
 export function App() {
-  const [view, setView] = useState<AppView>("skills");
+  const [view, setView] = useState<AppView>("overview");
   const [projects, setProjects] = useState<ProjectSettings>({
     version: 1,
     projects: [],
   });
   const [providerProfiles, setProviderProfiles] =
     useState<ProviderProfileSettings>({ version: 1, profiles: [] });
+  const [applicationSettings, setApplicationSettings] =
+    useState<ApplicationSettings>({
+      version: 1,
+      jobRetention: {
+        enabled: false,
+        maxTerminalJobs: 500,
+        maxAgeDays: 365,
+      },
+    });
   const [selectedProviderProfileId, setSelectedProviderProfileId] =
     useState("");
   const [jobs, setJobs] = useState<JobStore>({ version: 1, jobs: [] });
@@ -388,11 +403,11 @@ export function App() {
   );
 
   const activateProviderProfile = useCallback(
-    (profile: ProviderProfileRecord | undefined) => {
+    (profile: ProviderProfileRecord | undefined, selectedModel?: string) => {
       setSelectedProviderProfileId(profile?.id ?? "");
       setProviderKind(profile?.kind ?? "local");
       setEndpoint(profile?.endpoint ?? DEFAULT_ENDPOINT);
-      setModel(profile?.defaultModel ?? "");
+      setModel(selectedModel?.trim() || profile?.defaultModel || "");
       invalidateProviderHealth();
       invalidatePreflight();
     },
@@ -448,12 +463,16 @@ export function App() {
     void Promise.all([
       invoke<unknown>("list_projects"),
       invoke<unknown>("list_provider_profiles"),
+      invoke<unknown>("list_application_settings"),
       invoke<unknown>("list_jobs"),
     ])
-      .then(([rawProjects, rawProfiles, rawJobs]) => {
+      .then(([rawProjects, rawProfiles, rawApplicationSettings, rawJobs]) => {
         if (disposed) return;
         const nextProjects = normalizeProjectSettings(rawProjects);
         const nextProfiles = normalizeProviderProfileSettings(rawProfiles);
+        const nextApplicationSettings = normalizeApplicationSettings(
+          rawApplicationSettings,
+        );
         const nextJobs = normalizeJobStore(rawJobs);
         const nextActiveProject = nextProjects.projects.find(
           (project) => project.id === nextProjects.activeProjectId,
@@ -465,13 +484,14 @@ export function App() {
           ) ?? nextProfiles.profiles[0];
         setProjects(nextProjects);
         setProviderProfiles(nextProfiles);
+        setApplicationSettings(nextApplicationSettings);
         setJobs(nextJobs);
         setRepository(
           nextActiveProject?.workspacePath ?? nextActiveProject?.canonicalPath ?? "",
         );
-        activateProviderProfile(preferredProfile);
+        activateProviderProfile(preferredProfile, nextActiveProject?.defaultModel);
         if (!nextActiveProject) setView("projects");
-        else setView("skills");
+        else setView("overview");
       })
       .catch((error: unknown) => {
         if (!disposed) {
@@ -637,14 +657,21 @@ export function App() {
     }
   }, [activeJobId, jobs, runId]);
 
-  const applyProjectSettings = (nextProjects: ProjectSettings) => {
-    setProjects(nextProjects);
-    const nextActive = nextProjects.projects.find(
-      (project) => project.id === nextProjects.activeProjectId,
-    );
-    setRepository(nextActive?.workspacePath ?? nextActive?.canonicalPath ?? "");
-    invalidatePreflight();
-  };
+  const applyProjectSettings = useCallback(
+    (nextProjects: ProjectSettings) => {
+      setProjects(nextProjects);
+      const nextActive = nextProjects.projects.find(
+        (project) => project.id === nextProjects.activeProjectId,
+      );
+      const preferredProfile =
+        providerProfiles.profiles.find(
+          (profile) => profile.id === nextActive?.defaultProviderProfileId,
+        ) ?? providerProfiles.profiles[0];
+      setRepository(nextActive?.workspacePath ?? nextActive?.canonicalPath ?? "");
+      activateProviderProfile(preferredProfile, nextActive?.defaultModel);
+    },
+    [activateProviderProfile, providerProfiles.profiles],
+  );
 
   const addSavedProject = async () => {
     try {
@@ -661,7 +688,7 @@ export function App() {
       const nextProjects = normalizeProjectSettings(value);
       applyProjectSettings(nextProjects);
       setActiveJobId("");
-      setView("skills");
+      setView("overview");
       setNotice({ tone: "success", message: "Project saved and selected." });
     } catch (error) {
       setNotice({ tone: "error", message: errorMessage(error) });
@@ -677,7 +704,7 @@ export function App() {
       const value = await invoke<unknown>("select_saved_project", { projectId });
       applyProjectSettings(normalizeProjectSettings(value));
       setActiveJobId("");
-      setView("skills");
+      setView("overview");
       setNotice({ tone: "success", message: "Active project changed." });
     } catch (error) {
       setNotice({ tone: "error", message: errorMessage(error) });
@@ -707,6 +734,41 @@ export function App() {
       setNotice({ tone: "error", message: errorMessage(error) });
     } finally {
       setSavingSettings(false);
+    }
+  };
+
+  const saveProjectSettings = async (project: ProjectUpdateInput) => {
+    setSavingSettings(true);
+    try {
+      const value = await invoke<unknown>("update_saved_project", { project });
+      applyProjectSettings(normalizeProjectSettings(value));
+      setNotice({ tone: "success", message: "Project settings saved." });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const relinkSavedProject = async (projectId: string) => {
+    const project = projects.projects.find((item) => item.id === projectId);
+    if (!project) return;
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: `Relink ${project.name}`,
+      });
+      if (typeof selected !== "string") return;
+      await saveProjectSettings({
+        id: project.id,
+        name: project.name,
+        configuredPath: selected,
+        defaultProviderProfileId: project.defaultProviderProfileId,
+        defaultModel: project.defaultModel,
+      });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
     }
   };
 
@@ -808,8 +870,8 @@ export function App() {
   };
 
   const openDurableJob = async (jobId: string) => {
-    const job = jobs.jobs.find((item) => item.id === jobId);
-    if (!job || !matchesEditableJob(job)) return;
+    let job = jobs.jobs.find((item) => item.id === jobId);
+    if (!job || (!matchesEditableJob(job) && job.status !== "interrupted")) return;
     if (running && job.id !== activeJobId) {
       setNotice({
         tone: "warning",
@@ -817,11 +879,13 @@ export function App() {
       });
       return;
     }
+    const savedSkillId = job.skillId;
+    const savedSkillDigest = job.skillDigest;
     if (job.projectId !== projects.activeProjectId) {
       await selectSavedProject(job.projectId);
     }
     const currentSkill = catalog?.entries.find(
-      (skill) => skill.id === job.skillId && skill.digest === job.skillDigest,
+      (skill) => skill.id === savedSkillId && skill.digest === savedSkillDigest,
     );
     if (!currentSkill) {
       setNotice({
@@ -830,6 +894,20 @@ export function App() {
           "The exact skill version for this draft is no longer in the catalog. Refresh or clone the original skill source before resuming.",
       });
       return;
+    }
+    if (job.status === "interrupted") {
+      try {
+        const value = await invoke<unknown>("resume_interrupted_job", { jobId });
+        job = normalizeJobRecord(value);
+        applyJobRecord(job);
+        setNotice({
+          tone: "success",
+          message: "Interrupted attempt preserved. Setup restarted with a fresh preflight.",
+        });
+      } catch (error) {
+        setNotice({ tone: "error", message: errorMessage(error) });
+        return;
+      }
     }
     setActiveJobId(job.id);
     setSelectedSkillId(job.skillId);
@@ -863,6 +941,62 @@ export function App() {
       setNotice({ tone: "error", message: errorMessage(error) });
     } finally {
       setLoadingHistoryResult(false);
+    }
+  };
+
+  const saveGlobalSettings = async (settings: ApplicationSettings) => {
+    if (
+      settings.jobRetention.enabled &&
+      !window.confirm(
+        "Save and apply this retention policy now? Eligible terminal history may be permanently removed. Drafts, resumable jobs, active work, and immutable plan artifacts will be preserved.",
+      )
+    ) {
+      return;
+    }
+    setSavingSettings(true);
+    try {
+      const value = await invoke<unknown>("save_application_settings", { settings });
+      const nextSettings = normalizeApplicationSettings(value);
+      const jobsValue = await invoke<unknown>("list_jobs");
+      const nextJobs = normalizeJobStore(jobsValue);
+      const removedCount = Math.max(0, jobs.jobs.length - nextJobs.jobs.length);
+      setApplicationSettings(nextSettings);
+      setJobs(nextJobs);
+      setNotice({
+        tone: "success",
+        message:
+          removedCount > 0
+            ? `Retention settings saved; ${removedCount} terminal histor${removedCount === 1 ? "y entry" : "y entries"} removed.`
+            : "Retention settings saved.",
+      });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const deleteSavedJob = async (jobId: string) => {
+    const job = jobs.jobs.find((item) => item.id === jobId);
+    if (
+      !job ||
+      !window.confirm(
+        `Delete the ${job.skillName} history entry? Saved plan artifacts outside job history will remain on disk.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      const value = await invoke<unknown>("delete_saved_job", { jobId });
+      setJobs(normalizeJobStore(value));
+      if (selectedHistoryJobId === jobId) {
+        setSelectedHistoryJobId("");
+        setHistoryResult("");
+      }
+      if (activeJobId === jobId) setActiveJobId("");
+      setNotice({ tone: "success", message: "Job history deleted." });
+    } catch (error) {
+      setNotice({ tone: "error", message: errorMessage(error) });
     }
   };
 
@@ -1120,7 +1254,16 @@ export function App() {
           {notice.message}
         </div>
       ) : null}
-      {view === "skills" ? (
+      {view === "overview" && activeProject ? (
+        <OverviewPage
+          project={activeProject}
+          profile={selectedProviderProfile}
+          catalog={catalog}
+          jobs={jobs.jobs}
+          activeJob={activeJob}
+          onNavigate={setView}
+        />
+      ) : view === "skills" ? (
         <SkillsPage
           projectName={activeProject?.name ?? "No active project"}
           catalog={catalog}
@@ -1144,15 +1287,35 @@ export function App() {
           loadingResult={loadingHistoryResult}
           onSelectJob={(jobId) => void selectHistoryJob(jobId)}
           onOpenJob={(jobId) => void openDurableJob(jobId)}
+          onDeleteJob={(jobId) => void deleteSavedJob(jobId)}
+        />
+      ) : view === "settings" ? (
+        <SettingsPage
+          skillRoots={skillRoots}
+          applicationSettings={applicationSettings}
+          providerCount={providerProfiles.profiles.length}
+          projectCount={projects.projects.length}
+          jobCount={jobs.jobs.length}
+          loading={loadingRoots || scanningCatalog || savingSettings}
+          onBrowseRoot={() => void chooseSkillRoot()}
+          onAddRoot={() => setSkillRoots((roots) => [...roots, ""])}
+          onUpdateRoot={updateSkillRoot}
+          onRemoveRoot={removeSkillRoot}
+          onSaveRoots={() => void saveAndScanRoots()}
+          onSaveApplicationSettings={(settings) => void saveGlobalSettings(settings)}
+          onNavigate={setView}
         />
       ) : view === "projects" ? (
         <ProjectsPage
           settings={projects}
+          profiles={providerProfiles.profiles}
           busy={loadingSettings || savingSettings || running}
           onAdd={addSavedProject}
           onSelect={selectSavedProject}
+          onSave={(project) => void saveProjectSettings(project)}
+          onRelink={(projectId) => void relinkSavedProject(projectId)}
           onRemove={removeSavedProject}
-          onOpenPlan={() => setView("skills")}
+          onOpenPlan={() => setView("overview")}
         />
       ) : view === "providers" ? (
         <ProviderProfilesPage
@@ -1848,6 +2011,7 @@ export function App() {
               </div>
               {runId ? <code className="run-id">{runId.slice(0, 12)}</code> : null}
             </div>
+            {output ? <MarkdownChecklist markdown={output} /> : null}
             <article
               className={`output ${output ? "has-output" : ""}`}
               aria-live="polite"

@@ -24,14 +24,18 @@ mod settings;
 
 use jobs::{
     CreateJobRequest, JobProviderKind, JobRecord, JobStore, UpdateJobSetupRequest,
-    attach_preflight, begin_attempt, create_job as create_job_record, fail_start,
-    read_job_events as load_job_events, read_job_result as load_job_result, reconcile_jobs,
-    record_agent_event, update_job_setup as update_job_setup_record,
+    apply_job_retention, attach_preflight, begin_attempt, create_job as create_job_record,
+    delete_job as delete_job_record, fail_start, load_jobs, read_job_events as load_job_events,
+    read_job_result as load_job_result, reconcile_jobs, record_agent_event,
+    resume_interrupted_job as resume_interrupted_job_record,
+    update_job_setup as update_job_setup_record,
 };
 use settings::{
-    ProjectSettings, ProviderProfileInput, ProviderProfileKind, ProviderProfileSettings,
-    add_project, delete_provider_profile, load_projects, load_provider_profiles, remove_project,
-    save_projects, save_provider_profiles, select_project, upsert_provider_profile,
+    ApplicationSettings, ProjectSettings, ProjectUpdateInput, ProviderProfileInput,
+    ProviderProfileKind, ProviderProfileSettings, add_project, delete_provider_profile,
+    load_application_settings, load_projects, load_provider_profiles, remove_project,
+    save_application_settings as save_application_settings_record, save_projects,
+    save_provider_profiles, select_project, update_project, upsert_provider_profile,
 };
 
 const MAX_UTILITY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -325,6 +329,13 @@ fn provider_profiles_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("Could not resolve app configuration directory: {error}"))
 }
 
+fn application_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("application-settings.json"))
+        .map_err(|error| format!("Could not resolve app configuration directory: {error}"))
+}
+
 fn job_storage_root(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
@@ -436,6 +447,28 @@ fn remove_saved_project(app: AppHandle, project_id: String) -> Result<ProjectSet
 }
 
 #[tauri::command]
+fn update_saved_project(
+    app: AppHandle,
+    project: ProjectUpdateInput,
+) -> Result<ProjectSettings, String> {
+    if let Some(profile_id) = &project.default_provider_profile_id {
+        let profiles = load_provider_profiles(&provider_profiles_settings_path(&app)?)?;
+        if !profiles
+            .profiles
+            .iter()
+            .any(|profile| &profile.id == profile_id)
+        {
+            return Err("The selected default provider profile no longer exists".to_string());
+        }
+    }
+    let settings_path = project_settings_path(&app)?;
+    let mut settings = load_projects(&settings_path)?;
+    update_project(&mut settings, project)?;
+    save_projects(&settings_path, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
 fn list_provider_profiles(app: AppHandle) -> Result<ProviderProfileSettings, String> {
     load_provider_profiles(&provider_profiles_settings_path(&app)?)
 }
@@ -457,11 +490,37 @@ fn delete_saved_provider_profile(
     app: AppHandle,
     profile_id: String,
 ) -> Result<ProviderProfileSettings, String> {
+    let projects = load_projects(&project_settings_path(&app)?)?;
+    if projects
+        .projects
+        .iter()
+        .any(|project| project.default_provider_profile_id.as_deref() == Some(profile_id.as_str()))
+    {
+        return Err(
+            "This profile is a project default. Choose another project default before deleting it."
+                .to_string(),
+        );
+    }
     let settings_path = provider_profiles_settings_path(&app)?;
     let mut settings = load_provider_profiles(&settings_path)?;
     delete_provider_profile(&mut settings, &profile_id)?;
     save_provider_profiles(&settings_path, &settings)?;
     Ok(settings)
+}
+
+#[tauri::command]
+fn list_application_settings(app: AppHandle) -> Result<ApplicationSettings, String> {
+    load_application_settings(&application_settings_path(&app)?)
+}
+
+#[tauri::command]
+fn save_application_settings(
+    app: AppHandle,
+    settings: ApplicationSettings,
+) -> Result<ApplicationSettings, String> {
+    let path = application_settings_path(&app)?;
+    save_application_settings_record(&path, &settings)?;
+    load_application_settings(&path)
 }
 
 fn validate_job_provider_snapshot(
@@ -500,7 +559,14 @@ async fn list_jobs(
         .await
         .as_ref()
         .map(|active| active.run_id.clone());
-    reconcile_jobs(&job_storage_root(&app)?, active_run_id.as_deref())
+    let root = job_storage_root(&app)?;
+    let store = reconcile_jobs(&root, active_run_id.as_deref())?;
+    let application_settings = load_application_settings(&application_settings_path(&app)?)?;
+    if apply_job_retention(&root, &application_settings.job_retention)?.is_empty() {
+        Ok(store)
+    } else {
+        load_jobs(&root)
+    }
 }
 
 #[tauri::command]
@@ -549,6 +615,18 @@ fn read_job_result(app: AppHandle, job_id: String) -> Result<Option<Value>, Stri
 #[tauri::command]
 fn read_job_events(app: AppHandle, job_id: String) -> Result<Vec<Value>, String> {
     load_job_events(&job_storage_root(&app)?, &job_id)
+}
+
+#[tauri::command]
+fn resume_interrupted_job(app: AppHandle, job_id: String) -> Result<JobRecord, String> {
+    resume_interrupted_job_record(&job_storage_root(&app)?, &job_id)
+}
+
+#[tauri::command]
+fn delete_saved_job(app: AppHandle, job_id: String) -> Result<JobStore, String> {
+    let root = job_storage_root(&app)?;
+    delete_job_record(&root, &job_id)?;
+    load_jobs(&root)
 }
 
 async fn run_agent_utility(app: &AppHandle, request: Value) -> Result<Value, String> {
@@ -1193,14 +1271,19 @@ pub fn run() {
             add_saved_project,
             select_saved_project,
             remove_saved_project,
+            update_saved_project,
             list_provider_profiles,
             save_provider_profile,
             delete_saved_provider_profile,
+            list_application_settings,
+            save_application_settings,
             list_jobs,
             create_durable_job,
             update_durable_job_setup,
             read_job_result,
             read_job_events,
+            resume_interrupted_job,
+            delete_saved_job,
             scan_skill_catalog,
             prepare_plan,
             provider_health,

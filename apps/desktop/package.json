@@ -9,6 +9,7 @@
     "tauri": "tauri",
     "tauri:build": "tauri build",
     "tauri:dev": "tauri dev",
+    "test": "node --experimental-strip-types --test tests/application-settings.test.mjs tests/markdown-checklist.test.mjs tests/project-management.test.mjs",
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
