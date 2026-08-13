@@ -32,6 +32,25 @@ export interface ProjectSettings {
   projects: ProjectRecord[];
 }
 
+export interface ProjectUpdateInput {
+  id: string;
+  name: string;
+  configuredPath?: string;
+  defaultProviderProfileId?: string;
+  defaultModel?: string;
+}
+
+export interface JobRetentionSettings {
+  enabled: boolean;
+  maxTerminalJobs: number;
+  maxAgeDays?: number;
+}
+
+export interface ApplicationSettings {
+  version: number;
+  jobRetention: JobRetentionSettings;
+}
+
 export interface ProviderProfileRecord {
   id: string;
   name: string;
@@ -56,6 +75,12 @@ export interface ProviderProfileInput {
 export interface ProviderProfileSettings {
   version: number;
   profiles: ProviderProfileRecord[];
+}
+
+export interface ProviderCredentialStatus {
+  profileId: string;
+  source: "windowsVault" | "environment" | "none";
+  configured: boolean;
 }
 
 export type JobRunMode = "plan" | "apply";
@@ -382,6 +407,35 @@ export function normalizeProjectSettings(value: unknown): ProjectSettings {
   };
 }
 
+export function normalizeApplicationSettings(value: unknown): ApplicationSettings {
+  const settings = asRecord(value);
+  const retention = asRecord(at(settings, "jobRetention", "job_retention"));
+  const maxTerminalJobs = asNumber(
+    at(retention, "maxTerminalJobs", "max_terminal_jobs"),
+    500,
+  );
+  const rawMaxAgeDays = at(retention, "maxAgeDays", "max_age_days");
+  const maxAgeDays = asNumber(rawMaxAgeDays, 365);
+  return {
+    version: asNumber(settings.version, 1),
+    jobRetention: {
+      enabled: asBoolean(retention.enabled),
+      maxTerminalJobs:
+        Number.isInteger(maxTerminalJobs) &&
+        maxTerminalJobs >= 1 &&
+        maxTerminalJobs <= 10_000
+          ? maxTerminalJobs
+          : 500,
+      maxAgeDays:
+        rawMaxAgeDays === null || rawMaxAgeDays === undefined
+          ? undefined
+          : Number.isInteger(maxAgeDays) && maxAgeDays >= 1 && maxAgeDays <= 3_650
+            ? maxAgeDays
+            : 365,
+    },
+  };
+}
+
 export function normalizeProviderProfileSettings(
   value: unknown,
 ): ProviderProfileSettings {
@@ -408,6 +462,21 @@ export function normalizeProviderProfileSettings(
         };
       })
       .filter((profile) => profile.id && profile.defaultModel),
+  };
+}
+
+export function normalizeProviderCredentialStatus(
+  value: unknown,
+): ProviderCredentialStatus {
+  const status = asRecord(value);
+  const source = status.source;
+  return {
+    profileId: asString(at(status, "profileId", "profile_id")),
+    source:
+      source === "windowsVault" || source === "environment"
+        ? source
+        : "none",
+    configured: status.configured === true,
   };
 }
 

@@ -26,6 +26,7 @@ const sequences = {
   test: [
     npmRun("run", "test", "-w", "@pimp-code/skill-runtime"),
     npmRun("run", "test", "-w", "@pimp-code/agent-host"),
+    npmRun("run", "test", "-w", "@pimp-code/desktop"),
   ],
   typecheck: [
     npmRun("run", "typecheck", "-w", "@pimp-code/skill-runtime"),

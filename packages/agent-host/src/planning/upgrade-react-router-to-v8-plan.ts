@@ -755,6 +755,16 @@ export function renderUpgradeReactRouterToV8PlanMarkdown(
       "",
     );
   }
+  lines.push("", "## Work checklist", "");
+  if (plan.migrationSteps.length === 0 && plan.verification.length === 0) {
+    lines.push("No executable work is proposed.", "");
+  }
+  for (const step of plan.migrationSteps) {
+    lines.push(`- [ ] ${code(`change:${step.id}`)} - ${md(step.title)}`);
+  }
+  for (const verification of plan.verification) {
+    lines.push(`- [ ] ${code(`verify:${verification.id}`)} - ${md(verification.title)}`);
+  }
   lines.push("", "## Migration steps", "");
   if (plan.migrationSteps.length === 0) lines.push("No migration steps are proposed.", "");
   for (const step of plan.migrationSteps) {

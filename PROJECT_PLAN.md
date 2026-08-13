@@ -1,6 +1,6 @@
 # Pimp Code App — Product and Implementation Plan
 
-Status: Phase 1 plan-only slice implemented; live-provider and second-machine gates remain, updated 11 August 2026
+Status: Phase 1 plan-only slice implemented; live-provider and second-machine gates remain, updated 12 August 2026
 
 ## Recommended product direction
 
@@ -160,7 +160,7 @@ Renderer security invariants:
 - release sidecars resolved from integrity-checked packaged resources, never ambient `PATH` or workspace paths;
 - validate every command argument and re-resolve every path in the Rust core and engine;
 - render model/skill Markdown as untrusted, sanitized content;
-- API keys, filesystem APIs, process handles, and raw environment variables never enter renderer state.
+- API keys never enter retained renderer application state: the one-shot credential field is uncontrolled, is cleared before the trusted IPC promise is awaited, and receives only presence/source status back. Filesystem APIs, process handles, and raw environment variables never enter renderer state.
 
 The Tauri capability manifest, CSP, command surface, updater configuration, and bundled sidecars are release-gated security configuration. Tauri reduces the renderer's ambient authority but does not make the engine, provider traffic, or child processes a sandbox.
 
@@ -482,6 +482,14 @@ Phase 0 must select and prove a Windows containment mechanism with resource limi
 9. **Publish/recovery** — apply/export/discard, conflicts, rollback instructions, optional report/checklist export.
 10. **History/settings** — immutable runs, clone with another model, budgets, storage cleanup, provider and skill management.
 
+### Markdown work checklist contract
+
+Every applicable plan Markdown artifact includes one GitHub-flavored task-list item for each proposed change and verification, using a stable composite task key: `- [ ] change:<id> - <title>` or `- [ ] verify:<id> - <title>`. The plan artifact is an immutable approval record, so its tasks always begin unchecked.
+
+Apply/realization tracks task state by the stable composite key, not by parsing display text. Its append-only events distinguish `pending`, `in_progress`, `completed`, `failed`, and `skipped`. A task becomes `completed` only after its declared work and acceptance checks succeed. The execution report projects completed tasks as `- [x]`; failed, skipped, cancelled, or unfinished tasks remain `- [ ]` with a visible outcome and reason. This derived report never rewrites the approved plan artifact.
+
+The run workspace and saved-job history extract and display every Markdown checkbox, including completed/total progress and the current state. Checkbox state is read-only in result views; selection and approval are separate actions. The structured task/event record remains authoritative so restarts, duplicate labels, and Markdown formatting cannot corrupt execution state.
+
 ### Persistent application model and navigation
 
 The current single-screen plan wizard is a feasibility surface, not the intended product structure. Replace it with a persistent application shell built around saved projects, provider profiles, project-scoped skills, and durable jobs.
@@ -514,7 +522,7 @@ Saved project -> Project skills -> Start job -> Mode + LLM profile
 
 - Provider profiles are global reusable records selected at job setup; a project may define a default profile and model, but each job can override them.
 - A profile has a stable ID, display name, provider/runtime kind, endpoint or deployment metadata, default model, capability/health snapshot, revision, and timestamps.
-- Persist only non-secret profile metadata in app configuration. Store API keys and tokens in the operating-system credential vault and refer to them by credential reference; secrets must not enter renderer state, settings JSON, events, or job artifacts.
+- Persist only non-secret profile metadata in app configuration. Store API keys and tokens in the operating-system credential vault and refer to them by credential reference; one-shot secret submission must not be retained in renderer application state, settings JSON, events, or job artifacts.
 - Treat LM Studio, Ollama, and other user-managed endpoints as profiles with explicit loopback/LAN/remote egress classification. "Local" must not automatically mean offline or zero egress.
 - Connection tests and model discovery live on the Provider profiles page. Job setup selects a saved profile and exact model, with a link to manage profiles rather than editing endpoints or secrets inline.
 - Editing or deleting a profile does not rewrite old jobs. Draft jobs require re-selection and renewed approval when the referenced profile revision or model availability changes.
@@ -789,8 +797,8 @@ If the goal is to reach a trustworthy beta quickly, use these defaults:
 2. **Implementation complete; release gate pending:** replace workspace/system runtime lookup with checksum-pinned packaged Node, agent-host, and Claude Code resources. The NSIS installer builds locally; a clean second-Windows-machine install plus live Claude and local-model runs still gate portability.
 3. **Complete:** implement the recursive `../skills/**/SKILL.md` catalog, including malformed/orphaned metadata visibility, package digests, inert scripts, path/link rejection, and configurable roots.
 4. **Implementation complete; live smoke pending:** build certified `migrate-to-vite` and `upgrade-react-router-to-v8` read-only adapters with canonical repository confirmation, applicability and exact context preview, explicit Claude egress approval, zero model tools, structured plan validation, and app-owned Markdown/JSON artifacts. The `logo` repository is the positive Router 5 fixture.
-5. **Implementation in progress:** versioned project and non-secret provider-profile persistence, project switching, and the persistent application shell are implemented. OS credential-vault secret entry, project rename/relink/default-profile controls, and renderer integration tests remain before this slice is complete.
-6. **Implementation in progress:** stable job IDs, draft setup autosave, attempt IDs, plan-only state transitions, append-only host events, result/artifact references, history list/detail APIs, and restart-to-`interrupted` reconciliation are implemented. Retention/deletion policy and safe-checkpoint resume remain.
-7. **Implementation in progress:** project Skills and Jobs pages, Projects and Provider profiles management, skill-source controls, a durable current-job workspace, and Plan/Guided/Continuous mode presentation are implemented. Project Overview and separate global Settings surfaces remain; Apply modes stay disabled.
-8. **Implementation in progress:** Rust persistence, validation, transition, result-history, and interruption tests are implemented. Renderer integration tests and packaged Tauri restart smoke tests for multiple projects and profiles remain.
+5. **Implementation complete; installed-package gate pending:** versioned project and non-secret provider-profile persistence, project switching, project rename/relink/default-profile controls, and the persistent application shell are implemented. Provider defaults are enforced across project switching and referenced profiles cannot be deleted. Profile-scoped secrets now use Windows Credential Manager with presence-only renderer status, environment-reference compatibility, transactional cleanup on profile changes/deletion, output redaction, and selected-provider-only child-process injection. An isolated two-process release-binary smoke now proves two projects, two profiles, active-project/default-profile restoration, vault presence after restart, exact credential removal, runtime-manifest integrity, and absence of the synthetic credential marker from renderer and app-owned storage. A clean NSIS install on an ephemeral/second Windows machine remains part of the release gate.
+6. **Complete:** stable job IDs, draft setup autosave, attempt IDs, plan-only state transitions, append-only host events, result/artifact references, history list/detail APIs, restart-to-`interrupted` reconciliation, safe restart from a fresh preflight checkpoint, guarded manual history deletion, and opt-in count/age retention are implemented. Automatic retention applies only to terminal history and deliberately preserves drafts, ready/interrupted/active jobs, and separately stored immutable plan artifacts.
+7. **Complete:** Project Overview, project Skills and Jobs pages, Projects and Provider profiles management, global Settings with skill-source and retention management plus safety status, a durable current-job workspace, and Plan/Guided/Continuous mode presentation are implemented. Apply modes stay disabled.
+8. **Implementation in progress:** Rust persistence, validation, transition, result-history, interruption, resume, deletion, retention, project-update, credential-reference, secret-validation, environment-isolation, and provider-output-redaction tests are implemented. Renderer integration now covers project management, overview, global settings and retention controls, interrupted-job recovery controls, history deletion, Markdown checklists, saved-state startup, primary navigation, project switching, settings persistence, and one-shot credential submission/status through a mocked Tauri boundary. The Windows release-binary restart harness exercises multiple projects and profiles plus a real Credential Manager round trip across two standalone WebDriver sessions under a disposable app identity. NSIS installation/layout and second-machine portability remain separate release gates.
 9. Only after those foundations are verified, implement and certify Guided Apply and Continuous Apply with guarded writes, structured commands, explicit capability enforcement, isolated workspaces, verification, and recovery. Do not route either mode to the current generic read-only agent command.

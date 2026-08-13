@@ -17,11 +17,13 @@
     "build:agent": "node scripts/run-workspace-sequence.mjs build-agent",
     "prepare:sidecars": "node scripts/prepare-sidecars.mjs",
     "build:desktop": "node scripts/build-desktop.mjs",
+    "test:desktop:restart": "node scripts/run-desktop-release-restart-smoke.mjs",
     "dev": "node scripts/run-workspace-sequence.mjs dev",
     "test": "node scripts/run-workspace-sequence.mjs test",
     "typecheck": "node scripts/run-workspace-sequence.mjs typecheck"
   },
   "devDependencies": {
+    "@wdio/tauri-service": "^1.3.0",
     "esbuild": "^0.28.2"
   }
 }

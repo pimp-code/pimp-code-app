@@ -10,6 +10,8 @@ use uuid::Uuid;
 const SETTINGS_VERSION: u8 = 1;
 const MAX_PROJECTS: usize = 100;
 const MAX_PROVIDER_PROFILES: usize = 64;
+const MAX_RETAINED_TERMINAL_JOBS: u16 = 10_000;
+const MAX_RETENTION_DAYS: u16 = 3_650;
 const MAX_NAME_LENGTH: usize = 120;
 const MAX_PATH_LENGTH: usize = 2_000;
 const MAX_VALUE_LENGTH: usize = 2_000;
@@ -36,6 +38,16 @@ pub struct ProjectSettings {
     pub version: u8,
     pub active_project_id: Option<String>,
     pub projects: Vec<ProjectRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectUpdateInput {
+    pub id: String,
+    pub name: String,
+    pub configured_path: Option<String>,
+    pub default_provider_profile_id: Option<String>,
+    pub default_model: Option<String>,
 }
 
 impl Default for ProjectSettings {
@@ -92,6 +104,40 @@ impl Default for ProviderProfileSettings {
         Self {
             version: SETTINGS_VERSION,
             profiles: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRetentionSettings {
+    pub enabled: bool,
+    pub max_terminal_jobs: u16,
+    pub max_age_days: Option<u16>,
+}
+
+impl Default for JobRetentionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_terminal_jobs: 500,
+            max_age_days: Some(365),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplicationSettings {
+    pub version: u8,
+    pub job_retention: JobRetentionSettings,
+}
+
+impl Default for ApplicationSettings {
+    fn default() -> Self {
+        Self {
+            version: SETTINGS_VERSION,
+            job_retention: JobRetentionSettings::default(),
         }
     }
 }
@@ -338,6 +384,65 @@ pub fn remove_project(settings: &mut ProjectSettings, project_id: &str) -> Resul
     Ok(())
 }
 
+pub fn update_project(
+    settings: &mut ProjectSettings,
+    input: ProjectUpdateInput,
+) -> Result<(), String> {
+    let project_id = validate_text(&input.id, "Project ID", 100)?;
+    validate_uuid(&project_id, "Project ID")?;
+    let name = validate_text(&input.name, "Project name", MAX_NAME_LENGTH)?;
+    let default_provider_profile_id = if let Some(profile_id) = input.default_provider_profile_id {
+        let profile_id = validate_text(&profile_id, "Default provider-profile ID", 100)?;
+        validate_uuid(&profile_id, "Default provider-profile ID")?;
+        Some(profile_id)
+    } else {
+        None
+    };
+    let default_model =
+        validate_optional_text(input.default_model, "Default model", MAX_NAME_LENGTH)?;
+    if default_provider_profile_id.is_none() && default_model.is_some() {
+        return Err("A default model requires a default provider profile".to_string());
+    }
+
+    let relinked_path = input
+        .configured_path
+        .map(|configured_path| {
+            let configured_path = validate_text(&configured_path, "Project path", MAX_PATH_LENGTH)?;
+            let canonical = PathBuf::from(&configured_path)
+                .canonicalize()
+                .map_err(|error| format!("Could not resolve project path: {error}"))?;
+            if !canonical.is_dir() {
+                return Err("The selected project path is not a directory".to_string());
+            }
+            Ok((configured_path, normalize_path_for_node(&canonical)))
+        })
+        .transpose()?;
+
+    if let Some((_, canonical_path)) = &relinked_path
+        && settings.projects.iter().any(|project| {
+            project.id != project_id && project.canonical_path.eq_ignore_ascii_case(canonical_path)
+        })
+    {
+        return Err("This project path is already saved".to_string());
+    }
+
+    let project = settings
+        .projects
+        .iter_mut()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| "Project was not found".to_string())?;
+    project.name = name;
+    if let Some((configured_path, canonical_path)) = relinked_path {
+        project.configured_path = configured_path;
+        project.canonical_path = canonical_path;
+        project.workspace_path = None;
+    }
+    project.default_provider_profile_id = default_provider_profile_id;
+    project.default_model = default_model;
+    project.updated_at = now_millis();
+    Ok(())
+}
+
 fn validate_provider_settings(
     settings: ProviderProfileSettings,
 ) -> Result<ProviderProfileSettings, String> {
@@ -398,6 +503,42 @@ pub fn save_provider_profiles(
     settings: &ProviderProfileSettings,
 ) -> Result<(), String> {
     validate_provider_settings(settings.clone())?;
+    write_versioned(path, settings)
+}
+
+fn validate_application_settings(
+    settings: ApplicationSettings,
+) -> Result<ApplicationSettings, String> {
+    if settings.version != SETTINGS_VERSION {
+        return Err(format!(
+            "Unsupported application settings version {}",
+            settings.version
+        ));
+    }
+    if !(1..=MAX_RETAINED_TERMINAL_JOBS).contains(&settings.job_retention.max_terminal_jobs) {
+        return Err(format!(
+            "Terminal job retention must be between 1 and {MAX_RETAINED_TERMINAL_JOBS}"
+        ));
+    }
+    if let Some(days) = settings.job_retention.max_age_days
+        && !(1..=MAX_RETENTION_DAYS).contains(&days)
+    {
+        return Err(format!(
+            "Job retention age must be between 1 and {MAX_RETENTION_DAYS} days"
+        ));
+    }
+    Ok(settings)
+}
+
+pub fn load_application_settings(path: &Path) -> Result<ApplicationSettings, String> {
+    validate_application_settings(read_versioned(path, "Application")?)
+}
+
+pub fn save_application_settings(
+    path: &Path,
+    settings: &ApplicationSettings,
+) -> Result<(), String> {
+    validate_application_settings(settings.clone())?;
     write_versioned(path, settings)
 }
 
@@ -509,6 +650,107 @@ mod tests {
     }
 
     #[test]
+    fn project_update_renames_relinks_and_sets_provider_defaults() {
+        let directory = temporary_directory("project-update");
+        let original = directory.join("original");
+        let replacement = directory.join("replacement");
+        fs::create_dir_all(&original).expect("original project directory");
+        fs::create_dir_all(&replacement).expect("replacement project directory");
+        let mut settings = ProjectSettings::default();
+        add_project(
+            &mut settings,
+            original.to_string_lossy().into_owned(),
+            Some("Original".to_string()),
+        )
+        .expect("add project");
+        let project_id = settings.projects[0].id.clone();
+        let profile_id = Uuid::new_v4().to_string();
+
+        update_project(
+            &mut settings,
+            ProjectUpdateInput {
+                id: project_id,
+                name: "Renamed project".to_string(),
+                configured_path: Some(replacement.to_string_lossy().into_owned()),
+                default_provider_profile_id: Some(profile_id.clone()),
+                default_model: Some("project-model".to_string()),
+            },
+        )
+        .expect("update project");
+
+        let project = &settings.projects[0];
+        assert_eq!(project.name, "Renamed project");
+        assert_eq!(
+            project.canonical_path,
+            normalize_path_for_node(&replacement.canonicalize().expect("canonical replacement"))
+        );
+        assert_eq!(
+            project.default_provider_profile_id.as_deref(),
+            Some(profile_id.as_str())
+        );
+        assert_eq!(project.default_model.as_deref(), Some("project-model"));
+        assert_eq!(project.workspace_path, None);
+
+        fs::remove_dir_all(directory).expect("remove project update directory");
+    }
+
+    #[test]
+    fn project_update_rejects_model_without_provider_and_duplicate_relink() {
+        let directory = temporary_directory("project-update-invalid");
+        let first = directory.join("first");
+        let second = directory.join("second");
+        fs::create_dir_all(&first).expect("first project directory");
+        fs::create_dir_all(&second).expect("second project directory");
+        let mut settings = ProjectSettings::default();
+        add_project(
+            &mut settings,
+            first.to_string_lossy().into_owned(),
+            Some("First".to_string()),
+        )
+        .expect("add first project");
+        let first_id = settings.projects[0].id.clone();
+        add_project(
+            &mut settings,
+            second.to_string_lossy().into_owned(),
+            Some("Second".to_string()),
+        )
+        .expect("add second project");
+        let second_id = settings.projects[1].id.clone();
+
+        let missing_profile = update_project(
+            &mut settings,
+            ProjectUpdateInput {
+                id: first_id,
+                name: "First".to_string(),
+                configured_path: None,
+                default_provider_profile_id: None,
+                default_model: Some("orphan-model".to_string()),
+            },
+        );
+        assert_eq!(
+            missing_profile.expect_err("reject orphan model"),
+            "A default model requires a default provider profile"
+        );
+
+        let duplicate = update_project(
+            &mut settings,
+            ProjectUpdateInput {
+                id: second_id,
+                name: "Second".to_string(),
+                configured_path: Some(first.to_string_lossy().into_owned()),
+                default_provider_profile_id: None,
+                default_model: None,
+            },
+        );
+        assert_eq!(
+            duplicate.expect_err("reject duplicate relink"),
+            "This project path is already saved"
+        );
+
+        fs::remove_dir_all(directory).expect("remove invalid project update directory");
+    }
+
+    #[test]
     fn provider_profile_update_increments_revision_without_storing_secrets() {
         let directory = temporary_directory("profiles");
         let settings_path = directory.join("provider-profiles.json");
@@ -546,6 +788,42 @@ mod tests {
             settings
         );
         fs::remove_dir_all(directory).expect("remove temporary provider directory");
+    }
+
+    #[test]
+    fn application_retention_settings_round_trip_and_fail_closed() {
+        let directory = temporary_directory("application-settings");
+        let settings_path = directory.join("application-settings.json");
+        let settings = ApplicationSettings {
+            version: SETTINGS_VERSION,
+            job_retention: JobRetentionSettings {
+                enabled: true,
+                max_terminal_jobs: 250,
+                max_age_days: Some(180),
+            },
+        };
+        save_application_settings(&settings_path, &settings).expect("save application settings");
+        assert_eq!(
+            load_application_settings(&settings_path).expect("load application settings"),
+            settings
+        );
+
+        let mut invalid = settings.clone();
+        invalid.job_retention.max_terminal_jobs = 0;
+        assert_eq!(
+            save_application_settings(&settings_path, &invalid)
+                .expect_err("reject zero retained jobs"),
+            "Terminal job retention must be between 1 and 10000"
+        );
+        invalid.job_retention.max_terminal_jobs = 100;
+        invalid.job_retention.max_age_days = Some(0);
+        assert_eq!(
+            save_application_settings(&settings_path, &invalid)
+                .expect_err("reject zero retention days"),
+            "Job retention age must be between 1 and 3650 days"
+        );
+
+        fs::remove_dir_all(directory).expect("remove application settings directory");
     }
 
     #[test]

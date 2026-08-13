@@ -2,9 +2,9 @@ import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { spawn } from "node:child_process";
 
-const mode = process.argv[2];
+const [mode, ...tauriArgs] = process.argv.slice(2);
 if (mode !== "dev" && mode !== "build") {
-  throw new Error("Usage: node scripts/run-tauri.mjs <dev|build>");
+  throw new Error("Usage: node scripts/run-tauri.mjs <dev|build> [tauri arguments]");
 }
 
 const cargoBin = join(homedir(), ".cargo", "bin");
@@ -18,7 +18,7 @@ const tauriCli = join(
 );
 const child = spawn(
   process.execPath,
-  [tauriCli, mode],
+  [tauriCli, mode, ...tauriArgs],
   {
     cwd: join(repositoryRoot, "apps", "desktop"),
     env: {

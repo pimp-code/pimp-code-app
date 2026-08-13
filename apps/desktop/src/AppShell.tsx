@@ -1,8 +1,11 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type {
+  ApplicationSettings,
   JobRecord,
   ProjectRecord,
   ProjectSettings,
+  ProjectUpdateInput,
+  ProviderCredentialStatus,
   ProviderKind,
   ProviderProfileInput,
   ProviderProfileRecord,
@@ -10,8 +13,16 @@ import type {
   SkillCatalogEntry,
 } from "./contracts";
 import { formatBytes, shortDigest } from "./contracts";
+import { MarkdownChecklist } from "./MarkdownChecklist";
 
-export type AppView = "skills" | "plan" | "jobs" | "projects" | "providers";
+export type AppView =
+  | "overview"
+  | "skills"
+  | "plan"
+  | "jobs"
+  | "projects"
+  | "providers"
+  | "settings";
 
 interface AppShellProps {
   view: AppView;
@@ -76,11 +87,20 @@ export function AppShell({
         <nav className="rail-nav" aria-label="Primary">
           <button
             type="button"
+            className={view === "overview" ? "selected" : ""}
+            onClick={() => onNavigate("overview")}
+            disabled={!activeProject}
+          >
+            <span aria-hidden="true">01</span>
+            Overview
+          </button>
+          <button
+            type="button"
             className={view === "skills" ? "selected" : ""}
             onClick={() => onNavigate("skills")}
             disabled={!activeProject}
           >
-            <span aria-hidden="true">01</span>
+            <span aria-hidden="true">02</span>
             Skills
           </button>
           <button
@@ -89,7 +109,7 @@ export function AppShell({
             onClick={() => onNavigate("plan")}
             disabled={!activeJob}
           >
-            <span aria-hidden="true">02</span>
+            <span aria-hidden="true">03</span>
             Current job
           </button>
           <button
@@ -98,7 +118,7 @@ export function AppShell({
             onClick={() => onNavigate("jobs")}
             disabled={!activeProject}
           >
-            <span aria-hidden="true">03</span>
+            <span aria-hidden="true">04</span>
             Job history
           </button>
           <button
@@ -106,7 +126,7 @@ export function AppShell({
             className={view === "projects" ? "selected" : ""}
             onClick={() => onNavigate("projects")}
           >
-            <span aria-hidden="true">04</span>
+            <span aria-hidden="true">05</span>
             Projects
           </button>
           <button
@@ -114,8 +134,16 @@ export function AppShell({
             className={view === "providers" ? "selected" : ""}
             onClick={() => onNavigate("providers")}
           >
-            <span aria-hidden="true">05</span>
+            <span aria-hidden="true">06</span>
             LLM profiles
+          </button>
+          <button
+            type="button"
+            className={view === "settings" ? "selected" : ""}
+            onClick={() => onNavigate("settings")}
+          >
+            <span aria-hidden="true">07</span>
+            Settings
           </button>
         </nav>
 
@@ -143,21 +171,476 @@ export function AppShell({
 
 interface ProjectsPageProps {
   settings: ProjectSettings;
+  profiles: ProviderProfileRecord[];
   busy: boolean;
   onAdd: () => void;
   onSelect: (projectId: string) => void;
+  onSave: (project: ProjectUpdateInput) => void;
+  onRelink: (projectId: string) => void;
   onRemove: (projectId: string) => void;
   onOpenPlan: () => void;
 }
 
+interface OverviewPageProps {
+  project: ProjectRecord;
+  profile?: ProviderProfileRecord;
+  catalog?: SkillCatalog;
+  jobs: JobRecord[];
+  activeJob?: JobRecord;
+  onNavigate: (view: AppView) => void;
+}
+
+export function OverviewPage({
+  project,
+  profile,
+  catalog,
+  jobs,
+  activeJob,
+  onNavigate,
+}: OverviewPageProps) {
+  const projectJobs = jobs.filter((job) => job.projectId === project.id);
+  const runnableSkills =
+    catalog?.entries.filter(
+      (skill) => skill.status === "valid" && skill.planningSupported,
+    ).length ?? 0;
+  const completedJobs = projectJobs.filter((job) => job.status === "completed").length;
+  const recentJobs = projectJobs.slice(0, 3);
+
+  return (
+    <main className="management-page overview-page">
+      <header className="management-header overview-header">
+        <div>
+          <p className="eyebrow">Project overview</p>
+          <h1>{project.name}</h1>
+          <p>Choose a certified workflow, resume saved setup, or review previous planning runs.</p>
+        </div>
+        <button type="button" className="primary" onClick={() => onNavigate("skills")}>
+          Browse skills
+        </button>
+      </header>
+
+      <section className="overview-stats" aria-label="Project summary">
+        <article>
+          <span>Certified skills</span>
+          <strong>{runnableSkills}</strong>
+          <small>{catalog ? `${catalog.entries.length} catalog packages` : "Catalog loading"}</small>
+        </article>
+        <article>
+          <span>Saved jobs</span>
+          <strong>{projectJobs.length}</strong>
+          <small>{completedJobs} completed</small>
+        </article>
+        <article>
+          <span>Default LLM</span>
+          <strong>{profile?.name ?? "Per job"}</strong>
+          <small>{project.defaultModel ?? profile?.defaultModel ?? "Not configured"}</small>
+        </article>
+      </section>
+
+      <div className="overview-grid">
+        <section className="overview-panel">
+          <div className="overview-panel-heading">
+            <div>
+              <p className="eyebrow">Repository</p>
+              <h2>Project context</h2>
+            </div>
+            <button type="button" className="text-button" onClick={() => onNavigate("projects")}>
+              Project settings
+            </button>
+          </div>
+          <dl className="overview-context">
+            <div><dt>Canonical root</dt><dd><code>{project.canonicalPath}</code></dd></div>
+            <div><dt>Workspace</dt><dd><code>{project.workspacePath ?? "Repository root"}</code></dd></div>
+            <div><dt>LLM profile</dt><dd>{profile ? `${profile.name} · ${profile.defaultModel}` : "Choose per job"}</dd></div>
+          </dl>
+        </section>
+
+        <section className="overview-panel">
+          <div className="overview-panel-heading">
+            <div>
+              <p className="eyebrow">Recent activity</p>
+              <h2>Jobs</h2>
+            </div>
+            <button type="button" className="text-button" onClick={() => onNavigate("jobs")}>
+              View history
+            </button>
+          </div>
+          {recentJobs.length > 0 ? (
+            <div className="overview-job-list">
+              {recentJobs.map((job) => (
+                <button type="button" key={job.id} onClick={() => onNavigate("jobs")}>
+                  <span><strong>{job.skillName}</strong><small>{job.provider?.model ?? "Provider pending"}</small></span>
+                  <i className={`job-status ${job.status}`}>{job.status.replace("_", " ")}</i>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="overview-empty">
+              <p>No jobs yet. Starting a skill creates a durable draft.</p>
+              <button type="button" className="secondary" onClick={() => onNavigate("skills")}>
+                Start the first job
+              </button>
+            </div>
+          )}
+          {activeJob ? (
+            <button type="button" className="overview-current-job" onClick={() => onNavigate("plan")}>
+              Continue {activeJob.skillName}
+              <span>{activeJob.status.replace("_", " ")}</span>
+            </button>
+          ) : null}
+        </section>
+      </div>
+    </main>
+  );
+}
+
+interface SettingsPageProps {
+  skillRoots: string[];
+  applicationSettings: ApplicationSettings;
+  providerCount: number;
+  projectCount: number;
+  jobCount: number;
+  loading: boolean;
+  onBrowseRoot: () => void;
+  onAddRoot: () => void;
+  onUpdateRoot: (index: number, value: string) => void;
+  onRemoveRoot: (index: number) => void;
+  onSaveRoots: () => void;
+  onSaveApplicationSettings: (settings: ApplicationSettings) => void;
+  onNavigate: (view: AppView) => void;
+}
+
+export function SettingsPage({
+  skillRoots,
+  applicationSettings,
+  providerCount,
+  projectCount,
+  jobCount,
+  loading,
+  onBrowseRoot,
+  onAddRoot,
+  onUpdateRoot,
+  onRemoveRoot,
+  onSaveRoots,
+  onSaveApplicationSettings,
+  onNavigate,
+}: SettingsPageProps) {
+  const [retention, setRetention] = useState(applicationSettings.jobRetention);
+
+  useEffect(() => {
+    setRetention(applicationSettings.jobRetention);
+  }, [applicationSettings]);
+
+  const retentionIsValid =
+    Number.isInteger(retention.maxTerminalJobs) &&
+    retention.maxTerminalJobs >= 1 &&
+    retention.maxTerminalJobs <= 10_000 &&
+    (retention.maxAgeDays === undefined ||
+      (Number.isInteger(retention.maxAgeDays) &&
+        retention.maxAgeDays >= 1 &&
+        retention.maxAgeDays <= 3_650));
+
+  return (
+    <main className="management-page settings-page">
+      <header className="management-header">
+        <div>
+          <p className="eyebrow">Application configuration</p>
+          <h1>Settings</h1>
+          <p>Manage global skill sources and review app-owned configuration and safety boundaries.</p>
+        </div>
+      </header>
+
+      <div className="settings-grid">
+        <section className="settings-panel settings-skill-sources">
+          <div className="settings-panel-heading">
+            <div>
+              <p className="eyebrow">Discovery</p>
+              <h2>Skill sources</h2>
+            </div>
+            <span>{skillRoots.length} configured</span>
+          </div>
+          <p>Every root is scanned recursively. Package scripts remain inert during discovery.</p>
+          <div className="root-list">
+            {skillRoots.length === 0 ? (
+              <p className="empty-copy">No skill roots configured.</p>
+            ) : (
+              skillRoots.map((root, index) => (
+                <div className="root-row" key={`${root}-${index}`}>
+                  <label className="sr-only" htmlFor={`settings-skill-root-${index}`}>
+                    Skill root {index + 1}
+                  </label>
+                  <input
+                    id={`settings-skill-root-${index}`}
+                    value={root}
+                    onChange={(event) => onUpdateRoot(index, event.target.value)}
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="icon-button"
+                    onClick={() => onRemoveRoot(index)}
+                    aria-label={`Remove skill root ${root || index + 1}`}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+          <div className="root-actions">
+            <button type="button" className="secondary" onClick={onBrowseRoot}>Browse root</button>
+            <button type="button" className="secondary" onClick={onAddRoot}>Enter path</button>
+            <button type="button" className="primary" onClick={onSaveRoots} disabled={loading}>
+              {loading ? "Scanning…" : "Save & scan"}
+            </button>
+          </div>
+        </section>
+
+        <section className="settings-panel retention-panel">
+          <div className="settings-panel-heading">
+            <div><p className="eyebrow">Storage policy</p><h2>Job-history retention</h2></div>
+            <span>{retention.enabled ? "Enabled" : "Off"}</span>
+          </div>
+          <p>Cleanup applies only to completed, failed, cancelled, or blocked history. Drafts, ready jobs, interrupted jobs, active work, and separately stored immutable plan artifacts are preserved.</p>
+          <label className="retention-toggle">
+            <input
+              type="checkbox"
+              checked={retention.enabled}
+              onChange={(event) =>
+                setRetention((current) => ({ ...current, enabled: event.target.checked }))
+              }
+              disabled={loading}
+            />
+            <span>Automatically clean terminal job history when history is loaded</span>
+          </label>
+          <div className="retention-fields">
+            <label className="field" htmlFor="retention-max-jobs">
+              <span>Keep newest terminal jobs</span>
+              <input
+                id="retention-max-jobs"
+                type="number"
+                min={1}
+                max={10_000}
+                value={
+                  Number.isFinite(retention.maxTerminalJobs)
+                    ? retention.maxTerminalJobs
+                    : ""
+                }
+                onChange={(event) =>
+                  setRetention((current) => ({
+                    ...current,
+                    maxTerminalJobs: event.target.valueAsNumber,
+                  }))
+                }
+                disabled={loading || !retention.enabled}
+              />
+            </label>
+            <label className="field" htmlFor="retention-max-age">
+              <span>Maximum age in days</span>
+              <input
+                id="retention-max-age"
+                type="number"
+                min={1}
+                max={3_650}
+                value={
+                  retention.maxAgeDays !== undefined &&
+                  Number.isFinite(retention.maxAgeDays)
+                    ? retention.maxAgeDays
+                    : ""
+                }
+                placeholder="Never expire by age"
+                onChange={(event) =>
+                  setRetention((current) => ({
+                    ...current,
+                    maxAgeDays: event.target.value
+                      ? event.target.valueAsNumber
+                      : undefined,
+                  }))
+                }
+                disabled={loading || !retention.enabled}
+              />
+              <small>Leave empty to limit by count only.</small>
+            </label>
+          </div>
+          <button
+            type="button"
+            className="primary settings-save"
+            onClick={() =>
+              onSaveApplicationSettings({
+                version: applicationSettings.version,
+                jobRetention: retention,
+              })
+            }
+            disabled={loading || !retentionIsValid}
+          >
+            {loading ? "Saving…" : "Save retention policy"}
+          </button>
+        </section>
+
+        <section className="settings-panel">
+          <div className="settings-panel-heading">
+            <div><p className="eyebrow">Reusable configuration</p><h2>LLM profiles</h2></div>
+            <span>{providerCount}</span>
+          </div>
+          <p>Profiles store endpoints, model defaults, and credential references—not secret values.</p>
+          <button type="button" className="secondary" onClick={() => onNavigate("providers")}>
+            Manage LLM profiles
+          </button>
+        </section>
+
+        <section className="settings-panel">
+          <div className="settings-panel-heading">
+            <div><p className="eyebrow">Workspace</p><h2>Projects and history</h2></div>
+            <span>{projectCount} projects · {jobCount} jobs</span>
+          </div>
+          <p>Removing a project never deletes repository files. Deleting job history leaves separately stored immutable plan artifacts untouched.</p>
+          <div className="settings-actions">
+            <button type="button" className="secondary" onClick={() => onNavigate("projects")}>Manage projects</button>
+            <button type="button" className="secondary" onClick={() => onNavigate("jobs")}>Review job history</button>
+          </div>
+        </section>
+
+        <section className="settings-panel safety-panel">
+          <div className="settings-panel-heading">
+            <div><p className="eyebrow">Current safety boundary</p><h2>Plan-only engine</h2></div>
+            <span>Apply disabled</span>
+          </div>
+          <p>Guided and Continuous Apply remain unavailable until isolated writes, structured commands, verification, and recovery are certified.</p>
+        </section>
+      </div>
+    </main>
+  );
+}
+
+interface ProjectEditorProps {
+  project: ProjectRecord;
+  profiles: ProviderProfileRecord[];
+  busy: boolean;
+  onSave: (project: ProjectUpdateInput) => void;
+  onRelink: (projectId: string) => void;
+  onCancel: () => void;
+}
+
+export function ProjectEditor({
+  project,
+  profiles,
+  busy,
+  onSave,
+  onRelink,
+  onCancel,
+}: ProjectEditorProps) {
+  const [name, setName] = useState(project.name);
+  const [defaultProviderProfileId, setDefaultProviderProfileId] = useState(
+    project.defaultProviderProfileId ?? "",
+  );
+  const [defaultModel, setDefaultModel] = useState(project.defaultModel ?? "");
+  const selectedProfile = profiles.find(
+    (profile) => profile.id === defaultProviderProfileId,
+  );
+
+  return (
+    <div className="project-editor" aria-label={`Edit ${project.name}`}>
+      <label className="field" htmlFor={`project-name-${project.id}`}>
+        <span>Project name</span>
+        <input
+          id={`project-name-${project.id}`}
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          disabled={busy}
+        />
+      </label>
+      <label className="field" htmlFor={`project-profile-${project.id}`}>
+        <span>Default LLM profile</span>
+        <select
+          id={`project-profile-${project.id}`}
+          value={defaultProviderProfileId}
+          onChange={(event) => {
+            setDefaultProviderProfileId(event.target.value);
+            setDefaultModel("");
+          }}
+          disabled={busy}
+        >
+          <option value="">Choose per job</option>
+          {profiles.map((profile) => (
+            <option key={profile.id} value={profile.id}>
+              {profile.name} · {profile.defaultModel}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="field" htmlFor={`project-model-${project.id}`}>
+        <span>Default model override</span>
+        <input
+          id={`project-model-${project.id}`}
+          value={defaultModel}
+          onChange={(event) => setDefaultModel(event.target.value)}
+          placeholder={selectedProfile?.defaultModel ?? "Select a profile first"}
+          disabled={busy || !selectedProfile}
+          spellCheck={false}
+        />
+        <small>Leave empty to follow the profile default.</small>
+      </label>
+      <div className="project-editor-path">
+        <span>Repository path</span>
+        <code>{project.canonicalPath}</code>
+        <button
+          type="button"
+          className="text-button"
+          onClick={() => onRelink(project.id)}
+          disabled={busy}
+        >
+          Relink folder
+        </button>
+      </div>
+      <div className="project-editor-actions">
+        <button
+          type="button"
+          className="primary"
+          onClick={() =>
+            onSave({
+              id: project.id,
+              name,
+              defaultProviderProfileId: defaultProviderProfileId || undefined,
+              defaultModel:
+                defaultProviderProfileId && defaultModel.trim()
+                  ? defaultModel
+                  : undefined,
+            })
+          }
+          disabled={busy || !name.trim()}
+        >
+          {busy ? "Saving…" : "Save project"}
+        </button>
+        <button type="button" className="secondary" onClick={onCancel} disabled={busy}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function ProjectsPage({
   settings,
+  profiles,
   busy,
   onAdd,
   onSelect,
+  onSave,
+  onRelink,
   onRemove,
   onOpenPlan,
 }: ProjectsPageProps) {
+  const [editingProjectId, setEditingProjectId] = useState("");
+
+  useEffect(() => {
+    if (
+      editingProjectId &&
+      !settings.projects.some((project) => project.id === editingProjectId)
+    ) {
+      setEditingProjectId("");
+    }
+  }, [editingProjectId, settings.projects]);
+
   return (
     <main className="management-page">
       <header className="management-header">
@@ -187,6 +670,10 @@ export function ProjectsPage({
         <section className="management-grid" aria-label="Saved projects">
           {settings.projects.map((project) => {
             const active = project.id === settings.activeProjectId;
+            const defaultProfile = profiles.find(
+              (profile) => profile.id === project.defaultProviderProfileId,
+            );
+            const editing = editingProjectId === project.id;
             return (
               <article className={`management-card ${active ? "active" : ""}`} key={project.id}>
                 <div className="management-card-heading">
@@ -206,9 +693,26 @@ export function ProjectsPage({
                   </div>
                   <div>
                     <dt>Default LLM</dt>
-                    <dd>{project.defaultModel ?? "Choose per job"}</dd>
+                    <dd>
+                      {defaultProfile
+                        ? `${defaultProfile.name} · ${project.defaultModel ?? defaultProfile.defaultModel}`
+                        : "Choose per job"}
+                    </dd>
                   </div>
                 </dl>
+                {editing ? (
+                  <ProjectEditor
+                    project={project}
+                    profiles={profiles}
+                    busy={busy}
+                    onSave={(input) => {
+                      onSave(input);
+                      setEditingProjectId("");
+                    }}
+                    onRelink={onRelink}
+                    onCancel={() => setEditingProjectId("")}
+                  />
+                ) : null}
                 <div className="management-actions">
                   {active ? (
                     <button type="button" className="primary" onClick={onOpenPlan}>
@@ -224,6 +728,14 @@ export function ProjectsPage({
                       Switch to project
                     </button>
                   )}
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => setEditingProjectId(editing ? "" : project.id)}
+                    disabled={busy}
+                  >
+                    {editing ? "Close settings" : "Project settings"}
+                  </button>
                   <button
                     type="button"
                     className="text-button danger-text"
@@ -245,10 +757,13 @@ export function ProjectsPage({
 interface ProviderProfilesPageProps {
   profiles: ProviderProfileRecord[];
   selectedProfileId: string;
+  credentialStatus?: ProviderCredentialStatus;
   busy: boolean;
   onSelect: (profileId: string) => void;
   onSave: (input: ProviderProfileInput) => void;
   onDelete: (profileId: string) => void;
+  onSaveCredential: (profileId: string, secret: string) => void;
+  onDeleteCredential: (profileId: string) => void;
 }
 
 const EMPTY_PROFILE: ProviderProfileInput = {
@@ -262,14 +777,19 @@ const EMPTY_PROFILE: ProviderProfileInput = {
 export function ProviderProfilesPage({
   profiles,
   selectedProfileId,
+  credentialStatus,
   busy,
   onSelect,
   onSave,
   onDelete,
+  onSaveCredential,
+  onDeleteCredential,
 }: ProviderProfilesPageProps) {
   const [form, setForm] = useState<ProviderProfileInput>(EMPTY_PROFILE);
+  const credentialInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    if (credentialInput.current) credentialInput.current.value = "";
     const selected = profiles.find((profile) => profile.id === selectedProfileId);
     if (!selected) {
       setForm((current) =>
@@ -319,6 +839,27 @@ export function ProviderProfilesPage({
     form.name.trim().length > 0 &&
     form.defaultModel.trim().length > 0 &&
     (form.kind === "claude" || Boolean(form.endpoint?.trim()));
+  const currentCredentialStatus =
+    credentialStatus?.profileId === form.id ? credentialStatus : undefined;
+  const credentialLabel = !currentCredentialStatus
+    ? "Checking status..."
+    : currentCredentialStatus.source === "windowsVault"
+      ? currentCredentialStatus.configured
+        ? "Stored in Windows vault"
+        : "Vault entry unavailable"
+      : currentCredentialStatus.source === "environment"
+        ? currentCredentialStatus.configured
+          ? "Available from environment"
+          : "Environment key missing"
+        : "Not configured";
+
+  const submitCredential = () => {
+    const input = credentialInput.current;
+    const submitted = input?.value ?? "";
+    if (!form.id || !input || !submitted) return;
+    input.value = "";
+    onSaveCredential(form.id, submitted);
+  };
 
   return (
     <main className="management-page provider-page">
@@ -426,11 +967,54 @@ export function ProviderProfilesPage({
           </label>
 
           <div className="credential-note">
-            <strong>Credentials are not stored here</strong>
+            <div className="credential-status-row">
+              <strong>Profile credential</strong>
+              <span
+                className={currentCredentialStatus?.configured ? "configured" : ""}
+              >
+                {form.id ? credentialLabel : "Save the profile first"}
+              </span>
+            </div>
             <p>
-              This profile stores only a credential reference. The current runtime resolves
-              <code>{form.credentialRef}</code> from the trusted host environment; OS-vault secret entry is a separate implementation step.
+              Secrets are stored under this profile in Windows Credential Manager. Only the
+              selected provider receives its credential in the trusted child-process environment.
             </p>
+            {form.id ? (
+              <div className="credential-entry">
+                <label className="field" htmlFor="profile-credential">
+                  <span>Replace credential</span>
+                  <input
+                    id="profile-credential"
+                    ref={credentialInput}
+                    type="password"
+                    autoComplete="new-password"
+                    spellCheck={false}
+                    placeholder="Paste API key"
+                    disabled={busy}
+                  />
+                </label>
+                <div className="credential-actions">
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={submitCredential}
+                    disabled={busy}
+                  >
+                    Save to Windows vault
+                  </button>
+                  {currentCredentialStatus && currentCredentialStatus.source !== "none" ? (
+                    <button
+                      type="button"
+                      className="text-button danger-text"
+                      onClick={() => onDeleteCredential(form.id!)}
+                      disabled={busy}
+                    >
+                      Remove credential
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <button
@@ -684,6 +1268,7 @@ interface JobsPageProps {
   loadingResult: boolean;
   onSelectJob: (jobId: string) => void;
   onOpenJob: (jobId: string) => void;
+  onDeleteJob: (jobId: string) => void;
 }
 
 function jobTimestamp(value: number): string {
@@ -698,6 +1283,7 @@ export function JobsPage({
   loadingResult,
   onSelectJob,
   onOpenJob,
+  onDeleteJob,
 }: JobsPageProps) {
   const [showAllProjects, setShowAllProjects] = useState(false);
   const visibleJobs = showAllProjects
@@ -756,11 +1342,26 @@ export function JobsPage({
                     <p className="eyebrow">{selected.id.slice(0, 12)}</p>
                     <h2>{selected.skillName}</h2>
                   </div>
-                  {selected.status === "draft" || selected.status === "ready" ? (
-                    <button type="button" className="primary" onClick={() => onOpenJob(selected.id)}>
-                      Resume setup
-                    </button>
-                  ) : null}
+                  <div className="job-detail-actions">
+                    {selected.status === "draft" ||
+                    selected.status === "ready" ||
+                    selected.status === "interrupted" ? (
+                      <button type="button" className="primary" onClick={() => onOpenJob(selected.id)}>
+                        {selected.status === "interrupted"
+                          ? "Restart from setup"
+                          : "Resume setup"}
+                      </button>
+                    ) : null}
+                    {selected.status !== "planning" ? (
+                      <button
+                        type="button"
+                        className="text-button danger-text"
+                        onClick={() => onDeleteJob(selected.id)}
+                      >
+                        Delete history
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
                 <dl className="job-detail-meta">
                   <div><dt>Status</dt><dd>{selected.status.replace("_", " ")}</dd></div>
@@ -769,6 +1370,9 @@ export function JobsPage({
                   <div><dt>Updated</dt><dd>{jobTimestamp(selected.updatedAt)}</dd></div>
                 </dl>
                 {selected.lastError ? <div className="history-error">{selected.lastError}</div> : null}
+                {!loadingResult && resultText ? (
+                  <MarkdownChecklist markdown={resultText} />
+                ) : null}
                 <article className={`history-result ${resultText ? "has-result" : ""}`}>
                   {loadingResult
                     ? "Loading saved result…"

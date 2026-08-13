@@ -225,6 +225,14 @@ test("router plan schema, validator, prompt, renderer, and generic artifacts sta
       renderUpgradeReactRouterToV8PlanMarkdown(plan, fixture.preflight),
       renderUpgradeReactRouterToV8PlanMarkdown(plan, fixture.preflight),
     );
+    const markdown = renderUpgradeReactRouterToV8PlanMarkdown(plan, fixture.preflight);
+    assert.equal(
+      markdown.match(/^- \[ \] /gmu)?.length ?? 0,
+      plan.migrationSteps.length + plan.verification.length,
+    );
+    assert.match(markdown, /- \[ \] `change:replace-legacy-routes`/u);
+    assert.match(markdown, /- \[ \] `verify:route-tests`/u);
+    assert.doesNotMatch(markdown, /^- \[[xX]\] /mu);
     const prompt = buildUpgradeReactRouterToV8PlanPrompt({ preflight: fixture.preflight });
     assert.match(prompt, /Do not call tools/u);
     assert.ok(!prompt.includes(fixture.preflight.repository.repositoryRoot));

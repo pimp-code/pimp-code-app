@@ -1,4 +1,4 @@
-use crate::settings::{read_versioned, write_versioned};
+use crate::settings::{JobRetentionSettings, read_versioned, write_versioned};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -376,6 +376,120 @@ pub fn update_job_setup(root: &Path, request: UpdateJobSetupRequest) -> Result<J
     let result = job.clone();
     save_jobs(root, &store)?;
     Ok(result)
+}
+
+pub fn resume_interrupted_job(root: &Path, job_id: &str) -> Result<JobRecord, String> {
+    let mut store = load_jobs(root)?;
+    let job = store
+        .jobs
+        .iter_mut()
+        .find(|job| job.id == job_id)
+        .ok_or_else(|| "Job was not found".to_string())?;
+    if job.status != JobStatus::Interrupted {
+        return Err("Only an interrupted job can resume from a safe checkpoint".to_string());
+    }
+    if job.active_run_id.is_some() {
+        return Err("The interrupted job still has an active attempt".to_string());
+    }
+    job.status = JobStatus::Draft;
+    job.current_stage = "setup".to_string();
+    job.preflight_id = None;
+    job.last_error = None;
+    job.updated_at = now_millis();
+    let result = job.clone();
+    save_jobs(root, &store)?;
+    Ok(result)
+}
+
+pub fn delete_job(root: &Path, job_id: &str) -> Result<(), String> {
+    validate_uuid(job_id, "Job ID")?;
+    let mut store = load_jobs(root)?;
+    let job = store
+        .jobs
+        .iter()
+        .find(|job| job.id == job_id)
+        .ok_or_else(|| "Job was not found".to_string())?;
+    if job.status == JobStatus::Planning || job.active_run_id.is_some() {
+        return Err("An active job cannot be deleted".to_string());
+    }
+
+    let directory = job_directory(root, job_id)?;
+    let staged = root.join(format!(".deleting-{job_id}-{}", Uuid::new_v4()));
+    let had_directory = directory.exists();
+    if had_directory {
+        fs::rename(&directory, &staged)
+            .map_err(|error| format!("Could not stage job history for deletion: {error}"))?;
+    }
+    store.jobs.retain(|job| job.id != job_id);
+    if let Err(error) = save_jobs(root, &store) {
+        if had_directory {
+            let _ = fs::rename(&staged, &directory);
+        }
+        return Err(error);
+    }
+    if had_directory {
+        fs::remove_dir_all(&staged).map_err(|error| {
+            format!(
+                "Job history was removed, but its staged storage could not be cleaned up: {error}"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn is_terminal_history(status: JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled | JobStatus::Blocked
+    )
+}
+
+pub fn apply_job_retention(
+    root: &Path,
+    policy: &JobRetentionSettings,
+) -> Result<Vec<String>, String> {
+    if !policy.enabled {
+        return Ok(Vec::new());
+    }
+    let store = load_jobs(root)?;
+    let terminal_jobs = store
+        .jobs
+        .iter()
+        .filter(|job| is_terminal_history(job.status))
+        .collect::<Vec<_>>();
+    let mut selected = HashSet::new();
+    for job in terminal_jobs
+        .iter()
+        .skip(usize::from(policy.max_terminal_jobs))
+    {
+        selected.insert(job.id.clone());
+    }
+    if let Some(max_age_days) = policy.max_age_days {
+        let max_age_millis = u64::from(max_age_days)
+            .saturating_mul(24)
+            .saturating_mul(60)
+            .saturating_mul(60)
+            .saturating_mul(1_000);
+        let cutoff = now_millis().saturating_sub(max_age_millis);
+        for job in &terminal_jobs {
+            if job.updated_at < cutoff {
+                selected.insert(job.id.clone());
+            }
+        }
+    }
+
+    let ids = terminal_jobs
+        .iter()
+        .rev()
+        .filter(|job| selected.contains(&job.id))
+        .map(|job| job.id.clone())
+        .collect::<Vec<_>>();
+    let mut deleted = Vec::with_capacity(ids.len());
+    for job_id in ids {
+        delete_job(root, &job_id)?;
+        deleted.push(job_id);
+    }
+    Ok(deleted)
 }
 
 pub fn attach_preflight(root: &Path, job_id: &str, preflight: &Value) -> Result<JobRecord, String> {
@@ -803,7 +917,10 @@ mod tests {
         .expect("idempotent setup autosave");
 
         assert_eq!(after_autosave.status, JobStatus::Ready);
-        assert_eq!(after_autosave.preflight_id.as_deref(), Some(preflight_id.as_str()));
+        assert_eq!(
+            after_autosave.preflight_id.as_deref(),
+            Some(preflight_id.as_str())
+        );
         fs::remove_dir_all(root).expect("remove job store");
     }
 
@@ -856,5 +973,169 @@ mod tests {
             Some(JobStatus::Interrupted)
         );
         fs::remove_dir_all(root).expect("remove job store");
+    }
+
+    #[test]
+    fn interrupted_job_resumes_from_setup_with_a_fresh_preflight() {
+        let root = fixture_root();
+        let job = create_job(&root, create_request(Uuid::new_v4().to_string()))
+            .expect("create durable job");
+        let preflight_id = Uuid::new_v4().to_string();
+        attach_preflight(
+            &root,
+            &job.id,
+            &serde_json::json!({
+                "id": preflight_id,
+                "canonicalRepository": job.canonical_repository,
+                "skill": {
+                    "id": job.skill_id,
+                    "name": job.skill_name,
+                    "digest": job.skill_digest,
+                }
+            }),
+        )
+        .expect("attach preflight");
+        let run_id = Uuid::new_v4().to_string();
+        begin_attempt(
+            &root,
+            &job.id,
+            &run_id,
+            &preflight_id,
+            JobProviderKind::Local,
+            "fixture-model",
+            10,
+        )
+        .expect("begin attempt");
+        reconcile_jobs(&root, None).expect("interrupt orphaned attempt");
+
+        let resumed = resume_interrupted_job(&root, &job.id).expect("resume interrupted job");
+        assert_eq!(resumed.status, JobStatus::Draft);
+        assert_eq!(resumed.current_stage, "setup");
+        assert_eq!(resumed.preflight_id, None);
+        assert_eq!(resumed.active_run_id, None);
+        assert_eq!(resumed.last_error, None);
+        assert_eq!(resumed.attempts.len(), 1);
+        assert_eq!(resumed.attempts[0].outcome, Some(JobStatus::Interrupted));
+
+        fs::remove_dir_all(root).expect("remove resumable job store");
+    }
+
+    #[test]
+    fn job_deletion_removes_history_storage_but_rejects_active_attempts() {
+        let root = fixture_root();
+        let removable = create_job(&root, create_request(Uuid::new_v4().to_string()))
+            .expect("create removable job");
+        let active = create_job(&root, create_request(Uuid::new_v4().to_string()))
+            .expect("create active job");
+        let preflight_id = Uuid::new_v4().to_string();
+        attach_preflight(
+            &root,
+            &active.id,
+            &serde_json::json!({
+                "id": preflight_id,
+                "canonicalRepository": active.canonical_repository,
+                "skill": {
+                    "id": active.skill_id,
+                    "name": active.skill_name,
+                    "digest": active.skill_digest,
+                }
+            }),
+        )
+        .expect("attach active preflight");
+        begin_attempt(
+            &root,
+            &active.id,
+            &Uuid::new_v4().to_string(),
+            &preflight_id,
+            JobProviderKind::Local,
+            "fixture-model",
+            10,
+        )
+        .expect("begin active attempt");
+
+        assert_eq!(
+            delete_job(&root, &active.id).expect_err("reject active deletion"),
+            "An active job cannot be deleted"
+        );
+        let removable_directory = job_directory(&root, &removable.id).expect("job directory");
+        assert!(removable_directory.is_dir());
+        delete_job(&root, &removable.id).expect("delete inactive job");
+        assert!(!removable_directory.exists());
+        let store = load_jobs(&root).expect("load jobs after deletion");
+        assert!(store.jobs.iter().all(|job| job.id != removable.id));
+        assert!(store.jobs.iter().any(|job| job.id == active.id));
+
+        fs::remove_dir_all(root).expect("remove deletion job store");
+    }
+
+    #[test]
+    fn retention_prunes_old_terminal_history_and_preserves_resumable_jobs() {
+        let root = fixture_root();
+        let immutable_artifact = root.with_extension("immutable-plan.md");
+        fs::write(&immutable_artifact, "# Immutable plan").expect("write immutable artifact");
+        let project_id = Uuid::new_v4().to_string();
+        let newest = create_job(&root, create_request(project_id.clone())).expect("newest job");
+        let middle = create_job(&root, create_request(project_id.clone())).expect("middle job");
+        let oldest = create_job(&root, create_request(project_id.clone())).expect("oldest job");
+        let draft = create_job(&root, create_request(project_id.clone())).expect("draft job");
+        let interrupted = create_job(&root, create_request(project_id)).expect("interrupted job");
+        let mut store = load_jobs(&root).expect("load retention fixtures");
+        for job in &mut store.jobs {
+            if job.id == newest.id {
+                job.status = JobStatus::Completed;
+                job.updated_at = 300;
+            } else if job.id == middle.id {
+                job.status = JobStatus::Failed;
+                job.updated_at = 200;
+            } else if job.id == oldest.id {
+                job.status = JobStatus::Cancelled;
+                job.updated_at = 100;
+                job.artifact_paths = vec![immutable_artifact.to_string_lossy().into_owned()];
+            } else if job.id == interrupted.id {
+                job.status = JobStatus::Interrupted;
+                job.updated_at = 50;
+            }
+        }
+        save_jobs(&root, &store).expect("save retention fixtures");
+
+        assert!(
+            apply_job_retention(&root, &JobRetentionSettings::default())
+                .expect("disabled retention")
+                .is_empty()
+        );
+        let deleted = apply_job_retention(
+            &root,
+            &JobRetentionSettings {
+                enabled: true,
+                max_terminal_jobs: 2,
+                max_age_days: None,
+            },
+        )
+        .expect("count retention");
+        assert_eq!(deleted, vec![oldest.id.clone()]);
+        assert!(immutable_artifact.is_file());
+        let after_count = load_jobs(&root).expect("load count-retained jobs");
+        assert!(after_count.jobs.iter().any(|job| job.id == newest.id));
+        assert!(after_count.jobs.iter().any(|job| job.id == middle.id));
+        assert!(after_count.jobs.iter().any(|job| job.id == draft.id));
+        assert!(after_count.jobs.iter().any(|job| job.id == interrupted.id));
+
+        let age_deleted = apply_job_retention(
+            &root,
+            &JobRetentionSettings {
+                enabled: true,
+                max_terminal_jobs: 10,
+                max_age_days: Some(1),
+            },
+        )
+        .expect("age retention");
+        assert_eq!(age_deleted, vec![middle.id.clone(), newest.id.clone()]);
+        let after_age = load_jobs(&root).expect("load age-retained jobs");
+        assert_eq!(after_age.jobs.len(), 2);
+        assert!(after_age.jobs.iter().any(|job| job.id == draft.id));
+        assert!(after_age.jobs.iter().any(|job| job.id == interrupted.id));
+
+        fs::remove_dir_all(root).expect("remove retention job store");
+        fs::remove_file(immutable_artifact).expect("remove immutable artifact fixture");
     }
 }

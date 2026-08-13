@@ -837,6 +837,13 @@ test("Markdown rendering is deterministic and escapes repository/model text", as
     assert.match(first, /\\-\\-\\- Preserve/u);
     assert.match(first, /webpack\.config\.js/u);
     assert.match(first, /Requires separate approval: yes/u);
+    assert.equal(
+      first.match(/^- \[ \] /gmu)?.length ?? 0,
+      plan.changes.length + plan.verification.length,
+    );
+    assert.match(first, /- \[ \] `change:add-vite-pipeline`/u);
+    assert.match(first, /- \[ \] `verify:build-client`/u);
+    assert.doesNotMatch(first, /^- \[[xX]\] /mu);
     assert.ok(!first.includes("â€”") && !first.includes("â†’"));
   } finally {
     await cleanupFixture(fixture);
