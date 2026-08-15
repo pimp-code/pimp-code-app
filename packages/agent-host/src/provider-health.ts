@@ -1,5 +1,10 @@
+import { Codex } from "@openai/codex-sdk";
 import { assertLoopbackEndpoint } from "./validation.js";
 import type { ProviderConfig } from "./protocol.js";
+import {
+  buildBaseEnvironment,
+  configuredCodexExecutable,
+} from "./runtime-environment.js";
 
 const HEALTH_TIMEOUT_MS = 5_000;
 const MAX_MODELS_RESPONSE_BYTES = 1024 * 1024;
@@ -142,6 +147,45 @@ export async function checkProviderHealth(
   provider: ProviderConfig,
 ): Promise<ProviderHealth> {
   if (provider.kind === "local") return localHealth(provider);
+
+  if (provider.kind === "codex") {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return {
+        healthy: false,
+        status: "unavailable",
+        message: "OPENAI_API_KEY is not available to the agent host",
+        models: [{ id: "gpt-5.6-terra", label: "Codex SDK documented model" }],
+        checkedAt: new Date().toISOString(),
+        discovery: "static-aliases",
+      };
+    }
+    try {
+      const executable = configuredCodexExecutable();
+      new Codex({
+        apiKey,
+        env: buildBaseEnvironment(),
+        ...(executable ? { codexPathOverride: executable } : {}),
+      });
+      return {
+        healthy: true,
+        status: "ready",
+        message: "Codex SDK runtime and OpenAI credentials are available",
+        models: [{ id: "gpt-5.6-terra", label: "Codex SDK documented model" }],
+        checkedAt: new Date().toISOString(),
+        discovery: "static-aliases",
+      };
+    } catch (error) {
+      return {
+        healthy: false,
+        status: "unavailable",
+        message: error instanceof Error ? error.message : String(error),
+        models: [],
+        checkedAt: new Date().toISOString(),
+        discovery: "unavailable",
+      };
+    }
+  }
 
   const configured = Boolean(process.env.ANTHROPIC_API_KEY);
   return {

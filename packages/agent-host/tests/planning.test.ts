@@ -20,6 +20,10 @@ import {
   startPlanRun,
   type PlanRunnerDependencies,
 } from "../src/plan-runner.js";
+import {
+  startCodexPlanRun,
+  type CodexRunnerDependencies,
+} from "../src/codex-runner.js";
 import type { HostEvent } from "../src/protocol.js";
 import {
   assertStoredPreflightCurrent,
@@ -30,6 +34,7 @@ import {
   MIGRATE_TO_VITE_PLAN_SCHEMA_VERSION,
   MIGRATE_TO_VITE_PLAN_V1_SCHEMA,
   PlanValidationError,
+  UPGRADE_REACT_ROUTER_TO_V8_PLAN_V1_SCHEMA,
   assertMigrateToVitePreflightIntegrity,
   buildMigrateToVitePlanPrompt,
   isCertifiedPlanningSkillIdentity,
@@ -61,6 +66,34 @@ interface PlanningFixture {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function assertCodexStructuredOutputSchema(value: unknown, path = "$"): void {
+  assert.ok(typeof value === "object" && value !== null && !Array.isArray(value), `${path} must be a schema object`);
+  const schema = value as Record<string, unknown>;
+  assert.ok("type" in schema, `${path} must declare an explicit type`);
+  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+
+  if (types.includes("object")) {
+    assert.equal(schema.additionalProperties, false, `${path} must reject additional properties`);
+    assert.ok(
+      typeof schema.properties === "object" && schema.properties !== null && !Array.isArray(schema.properties),
+      `${path} must declare properties`,
+    );
+    const properties = schema.properties as Record<string, unknown>;
+    assert.deepEqual(
+      [...((schema.required as unknown[]) ?? [])].sort(),
+      Object.keys(properties).sort(),
+      `${path} must require every property`,
+    );
+    for (const [name, propertySchema] of Object.entries(properties)) {
+      assertCodexStructuredOutputSchema(propertySchema, `${path}.properties.${name}`);
+    }
+  }
+
+  if (types.includes("array")) {
+    assertCodexStructuredOutputSchema(schema.items, `${path}.items`);
+  }
 }
 
 async function runUtilityRequest(request: unknown): Promise<Record<string, unknown>> {
@@ -1038,6 +1071,175 @@ test("plan runner gives the provider only the approved snapshot and the structur
   }
 });
 
+test("Codex planning schemas satisfy the Structured Outputs object contract", () => {
+  assertCodexStructuredOutputSchema(MIGRATE_TO_VITE_PLAN_V1_SCHEMA);
+  assertCodexStructuredOutputSchema(UPGRADE_REACT_ROUTER_TO_V8_PLAN_V1_SCHEMA);
+});
+
+test("Codex plan jobs use the official SDK with a read-only, no-tool boundary", async () => {
+  const fixture = await makeFixture();
+  const previousApiKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "codex-planning-test-key";
+  try {
+    const events: HostEvent[] = [];
+    let clientOptions: Record<string, unknown> = {};
+    let threadOptions: Record<string, unknown> = {};
+    let turnOptions: Record<string, unknown> = {};
+    let prompt = "";
+    const createCodex = ((options: unknown) => {
+      clientOptions = options as Record<string, unknown>;
+      return {
+        startThread(options: unknown) {
+          threadOptions = options as Record<string, unknown>;
+          return {
+            id: "codex-planning-session",
+            async runStreamed(input: unknown, options: unknown) {
+              prompt = String(input);
+              turnOptions = options as Record<string, unknown>;
+              return {
+                events: (async function* () {
+                  yield { type: "thread.started", thread_id: "codex-planning-session" };
+                  yield {
+                    type: "item.completed",
+                    item: {
+                      id: "message-1",
+                      type: "agent_message",
+                      text: JSON.stringify(planFor(fixture.preflight)),
+                    },
+                  };
+                  yield {
+                    type: "turn.completed",
+                    usage: {
+                      input_tokens: 70,
+                      cached_input_tokens: 10,
+                      cache_write_input_tokens: 0,
+                      output_tokens: 30,
+                      reasoning_output_tokens: 5,
+                    },
+                  };
+                })(),
+              };
+            },
+          };
+        },
+      };
+    }) as NonNullable<CodexRunnerDependencies["createCodex"]>;
+
+    const run = startCodexPlanRun(
+      {
+        type: "start_plan",
+        runId: "e233703d-e523-46c7-b164-9ce6154469df",
+        preflightPath: join(fixture.outputRoot, "preflight.json"),
+        maxTurns: 4,
+        provider: { kind: "codex", model: "gpt-5.6-terra" },
+        remoteEgressApproved: true,
+      },
+      (event) => events.push(event),
+      {
+        createCodex,
+        loadPreflight: async () => ({
+          schemaVersion: "pimp.preflight-record.v1",
+          id: "49b68cb3-25e5-43f4-859c-17fb9f9ab9b8",
+          createdAt: "2026-08-11T00:00:00.000Z",
+          skillCatalogEntryId: "test-skill",
+          skillPackageRoot: join(fixture.base, "skill"),
+          preflight: fixture.preflight,
+        }),
+        assertCurrent: async () => undefined,
+      },
+    );
+    await run.done;
+
+    assert.equal(clientOptions.apiKey, "codex-planning-test-key");
+    assert.equal(threadOptions.model, "gpt-5.6-terra");
+    assert.equal(threadOptions.sandboxMode, "read-only");
+    assert.equal(threadOptions.approvalPolicy, "never");
+    assert.equal(threadOptions.networkAccessEnabled, false);
+    assert.equal(threadOptions.webSearchMode, "disabled");
+    assert.equal(threadOptions.workingDirectory, fixture.outputRoot);
+    assert.deepEqual(turnOptions.outputSchema, MIGRATE_TO_VITE_PLAN_V1_SCHEMA);
+    assert.ok(prompt.includes(fixture.preflight.context.manifest.manifestSha256));
+    assert.ok(prompt.includes("Do not run commands"));
+    assert.equal(events.some((event) => event.type === "tool_call"), false);
+    const result = events.find((event) => event.type === "result");
+    assert.ok(result?.type === "result" && result.success);
+    assert.equal(result.sessionId, "codex-planning-session");
+    assert.equal(result.metadata?.provider, "codex");
+    assert.equal(result.metadata?.usage?.totalTokens, 100);
+  } finally {
+    if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousApiKey;
+    await cleanupFixture(fixture);
+  }
+});
+
+test("Codex plan jobs fail closed when the SDK attempts a tool call", async () => {
+  const fixture = await makeFixture();
+  const previousApiKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "codex-boundary-test-key";
+  try {
+    const events: HostEvent[] = [];
+    let signal: AbortSignal | undefined;
+    const createCodex = (() => ({
+      startThread: () => ({
+        id: "codex-forbidden-tool-session",
+        async runStreamed(_input: unknown, options: { signal?: AbortSignal }) {
+          signal = options.signal;
+          return {
+            events: (async function* () {
+              yield { type: "thread.started", thread_id: "codex-forbidden-tool-session" };
+              yield {
+                type: "item.completed",
+                item: {
+                  id: "command-1",
+                  type: "command_execution",
+                  command: "Get-ChildItem",
+                  aggregated_output: "",
+                  exit_code: 0,
+                  status: "completed",
+                },
+              };
+            })(),
+          };
+        },
+      }),
+    })) as NonNullable<CodexRunnerDependencies["createCodex"]>;
+    const run = startCodexPlanRun(
+      {
+        type: "start_plan",
+        runId: "8aa0dd69-d001-41d2-98cb-287c41643d98",
+        preflightPath: join(fixture.outputRoot, "preflight.json"),
+        maxTurns: 2,
+        provider: { kind: "codex", model: "gpt-5.6-terra" },
+        remoteEgressApproved: true,
+      },
+      (event) => events.push(event),
+      {
+        createCodex,
+        loadPreflight: async () => ({
+          schemaVersion: "pimp.preflight-record.v1",
+          id: "b88b846e-6c0c-4f9d-b4f6-b2e2690f5bb1",
+          createdAt: "2026-08-11T00:00:00.000Z",
+          skillCatalogEntryId: "test-skill",
+          skillPackageRoot: join(fixture.base, "skill"),
+          preflight: fixture.preflight,
+        }),
+        assertCurrent: async () => undefined,
+      },
+    );
+    await run.done;
+
+    const result = events.find((event) => event.type === "result");
+    assert.ok(result?.type === "result" && !result.success);
+    assert.match(result.error ?? "", /attempted a command execution/u);
+    assert.equal(signal?.aborted, true);
+  } finally {
+    if (previousApiKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousApiKey;
+    await cleanupFixture(fixture);
+  }
+});
+
 test("plan runner fails closed when the SDK cannot prove the zero-tool boundary", async () => {
   const fixture = await makeFixture();
   const previousApiKey = process.env.ANTHROPIC_API_KEY;
@@ -1155,7 +1357,7 @@ test("the published plan schema describes strict nested objects", () => {
   assert.equal(schema.properties.verification.items.additionalProperties, false);
   assert.deepEqual(
     schema.properties.verification.items.properties.requiresApproval,
-    { const: true },
+    { type: "boolean", const: true },
   );
   assert.equal(schema.properties.cleanupCandidates.items.additionalProperties, false);
   const prototypeKey = JSON.parse('{"__proto__":{"polluted":true},"safe":1}') as unknown;

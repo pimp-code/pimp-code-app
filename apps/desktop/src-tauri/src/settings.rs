@@ -64,6 +64,7 @@ impl Default for ProjectSettings {
 #[serde(rename_all = "lowercase")]
 pub enum ProviderProfileKind {
     Claude,
+    Codex,
     Local,
 }
 
@@ -476,10 +477,12 @@ fn validate_provider_settings(
                     MAX_VALUE_LENGTH,
                 )?;
             }
-            ProviderProfileKind::Claude if profile.endpoint.is_some() => {
-                return Err("Claude profiles cannot store a custom endpoint".to_string());
+            ProviderProfileKind::Claude | ProviderProfileKind::Codex
+                if profile.endpoint.is_some() =>
+            {
+                return Err("Remote provider profiles cannot store a custom endpoint".to_string());
             }
-            ProviderProfileKind::Claude => {}
+            ProviderProfileKind::Claude | ProviderProfileKind::Codex => {}
         }
         if profile.revision == 0 {
             return Err("Provider-profile revision must be positive".to_string());
@@ -554,7 +557,7 @@ pub fn upsert_provider_profile(
             "Local endpoint",
             MAX_VALUE_LENGTH,
         )?),
-        ProviderProfileKind::Claude => None,
+        ProviderProfileKind::Claude | ProviderProfileKind::Codex => None,
     };
     let credential_ref = validate_optional_text(
         input.credential_ref,

@@ -1,7 +1,12 @@
-export type ProviderKind = "claude" | "local";
+export type ProviderKind = "claude" | "codex" | "local";
 
 export interface ClaudeProviderConfig {
   kind: "claude";
+  model: string;
+}
+
+export interface CodexProviderConfig {
+  kind: "codex";
   model: string;
 }
 
@@ -11,7 +16,10 @@ export interface LocalProviderConfig {
   endpoint: string;
 }
 
-export type ProviderConfig = ClaudeProviderConfig | LocalProviderConfig;
+export type ProviderConfig =
+  | ClaudeProviderConfig
+  | CodexProviderConfig
+  | LocalProviderConfig;
 
 export interface ProjectRecord {
   id: string;
@@ -448,7 +456,10 @@ export function normalizeProviderProfileSettings(
         return {
           id: asString(profile.id),
           name: asString(profile.name, "Unnamed profile"),
-          kind: profile.kind === "claude" ? "claude" : "local",
+          kind:
+            profile.kind === "claude" || profile.kind === "codex"
+              ? profile.kind
+              : "local",
           endpoint: asString(profile.endpoint) || undefined,
           defaultModel: asString(
             at(profile, "defaultModel", "default_model"),
@@ -507,7 +518,10 @@ function normalizeJobProvider(value: unknown): JobProviderSnapshot | undefined {
       at(provider, "profileName", "profile_name"),
       "Unknown profile",
     ),
-    kind: provider.kind === "claude" ? "claude" : "local",
+    kind:
+      provider.kind === "claude" || provider.kind === "codex"
+        ? provider.kind
+        : "local",
     endpoint: asString(provider.endpoint) || undefined,
     model,
   };

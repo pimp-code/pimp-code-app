@@ -4,6 +4,10 @@ export type ProviderConfig =
       model: string;
     }
   | {
+      kind: "codex";
+      model: string;
+    }
+  | {
       kind: "local";
       model: string;
       endpoint: string;
@@ -34,6 +38,11 @@ export interface CancelCommand {
 export type RunCommand = StartCommand | StartPlanCommand;
 
 export type HostCommand = RunCommand | CancelCommand;
+
+export interface ActiveRun {
+  abort(): void;
+  done: Promise<void>;
+}
 
 export interface RunArtifactPaths {
   runDirectory?: string;

@@ -4,11 +4,11 @@ import {
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
-  buildBaseEnvironment,
+  buildClaudeEnvironment,
   configuredClaudeExecutable,
   redactDiagnostic,
-  type ActiveRun,
-} from "./agent-runner.js";
+} from "./runtime-environment.js";
+import { startCodexPlanRun } from "./codex-runner.js";
 import { startLocalAnthropicBridge, type LocalBridge } from "./local-anthropic-bridge.js";
 import {
   getPlanningAdapter,
@@ -26,6 +26,7 @@ import type {
   RunResultMetadata,
   RunUsage,
   StartPlanCommand,
+  ActiveRun,
 } from "./protocol.js";
 
 const PLAN_SYSTEM_PROMPT = [
@@ -128,6 +129,9 @@ export function startPlanRun(
   emit: (event: HostEvent) => void,
   dependencies: PlanRunnerDependencies = {},
 ): ActiveRun {
+  if (command.provider.kind === "codex") {
+    return startCodexPlanRun(command, emit, dependencies);
+  }
   const abortController = new AbortController();
   let cancelled = false;
 
@@ -166,7 +170,7 @@ export function startPlanRun(
         },
       });
 
-      const environment = buildBaseEnvironment();
+      const environment = buildClaudeEnvironment();
       if (command.provider.kind === "claude") {
         const apiKey = process.env.ANTHROPIC_API_KEY;
         if (!apiKey) {
@@ -176,7 +180,7 @@ export function startPlanRun(
           throw new Error("Explicit remote-egress approval is required for Claude");
         }
         environment.ANTHROPIC_API_KEY = apiKey;
-      } else {
+      } else if (command.provider.kind === "local") {
         bridge = await startLocalAnthropicBridge({
           endpoint: command.provider.endpoint,
           model: command.provider.model,
@@ -188,6 +192,8 @@ export function startPlanRun(
         environment.ANTHROPIC_MODEL = command.provider.model;
         environment.ANTHROPIC_CUSTOM_MODEL_OPTION = command.provider.model;
         environment.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS = "1";
+      } else {
+        throw new Error("Unsupported provider for the Claude plan runner");
       }
 
       emit({

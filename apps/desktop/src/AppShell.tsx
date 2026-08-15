@@ -820,12 +820,16 @@ export function ProviderProfilesPage({
       credentialRef:
         kind === "claude"
           ? "environment:ANTHROPIC_API_KEY"
+          : kind === "codex"
+            ? "environment:OPENAI_API_KEY"
           : "environment:LOCAL_LLM_API_KEY",
       defaultModel:
         current.kind === kind
           ? current.defaultModel
           : kind === "claude"
             ? "sonnet"
+            : kind === "codex"
+              ? "gpt-5.6-terra"
             : "",
     }));
   };
@@ -838,7 +842,7 @@ export function ProviderProfilesPage({
   const canSave =
     form.name.trim().length > 0 &&
     form.defaultModel.trim().length > 0 &&
-    (form.kind === "claude" || Boolean(form.endpoint?.trim()));
+    (form.kind !== "local" || Boolean(form.endpoint?.trim()));
   const currentCredentialStatus =
     credentialStatus?.profileId === form.id ? credentialStatus : undefined;
   const credentialLabel = !currentCredentialStatus
@@ -888,7 +892,13 @@ export function ProviderProfilesPage({
               >
                 <span>
                   <strong>{profile.name}</strong>
-                  <small>{profile.kind === "claude" ? "Claude" : "Local bridge"}</small>
+                  <small>
+                    {profile.kind === "claude"
+                      ? "Claude"
+                      : profile.kind === "codex"
+                        ? "Codex SDK"
+                        : "Local bridge"}
+                  </small>
                 </span>
                 <code>{profile.defaultModel}</code>
               </button>
@@ -941,6 +951,14 @@ export function ProviderProfilesPage({
             >
               Claude
             </button>
+            <button
+              type="button"
+              className={form.kind === "codex" ? "selected" : ""}
+              aria-pressed={form.kind === "codex"}
+              onClick={() => chooseKind("codex")}
+            >
+              Codex SDK
+            </button>
           </div>
 
           {form.kind === "local" ? (
@@ -961,7 +979,13 @@ export function ProviderProfilesPage({
               id="profile-model"
               value={form.defaultModel}
               onChange={(event) => setForm((current) => ({ ...current, defaultModel: event.target.value }))}
-              placeholder={form.kind === "claude" ? "sonnet" : "Loaded model ID"}
+              placeholder={
+                form.kind === "claude"
+                  ? "sonnet"
+                  : form.kind === "codex"
+                    ? "gpt-5.6-terra"
+                    : "Loaded model ID"
+              }
               spellCheck={false}
             />
           </label>

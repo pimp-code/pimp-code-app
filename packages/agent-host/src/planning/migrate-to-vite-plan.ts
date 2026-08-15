@@ -133,8 +133,11 @@ const dependencyChangeSchema = {
   required: ["name", "action", "section", "reason"],
   properties: {
     name: { type: "string" },
-    action: { enum: CHANGE_ACTIONS },
-    section: { enum: ["dependencies", "devDependencies", "peerDependencies"] },
+    action: { type: "string", enum: CHANGE_ACTIONS },
+    section: {
+      type: "string",
+      enum: ["dependencies", "devDependencies", "peerDependencies"],
+    },
     reason: { type: "string" },
   },
 } as const;
@@ -145,7 +148,7 @@ const scriptChangeSchema = {
   required: ["name", "action", "proposedCommand", "reason"],
   properties: {
     name: { type: "string" },
-    action: { enum: CHANGE_ACTIONS },
+    action: { type: "string", enum: CHANGE_ACTIONS },
     proposedCommand: { type: ["string", "null"] },
     reason: { type: "string" },
   },
@@ -170,7 +173,7 @@ const verificationSchema = {
     args: { type: "array", items: { type: "string" } },
     purpose: { type: "string" },
     expectedOutcome: { type: "string" },
-    requiresApproval: { const: true },
+    requiresApproval: { type: "boolean", const: true },
   },
 } as const;
 
@@ -180,8 +183,8 @@ const cleanupCandidateSchema = {
   required: ["subject", "kind", "action", "evidence", "reason"],
   properties: {
     subject: { type: "string" },
-    kind: { enum: ["dependency", "path", "script"] },
-    action: { enum: ["investigate", "remove", "retain"] },
+    kind: { type: "string", enum: ["dependency", "path", "script"] },
+    action: { type: "string", enum: ["investigate", "remove", "retain"] },
     evidence: { type: "array", items: evidenceSchema },
     reason: { type: "string" },
   },
@@ -207,7 +210,7 @@ export const MIGRATE_TO_VITE_PLAN_V1_SCHEMA = {
     "filesInspected",
   ],
   properties: {
-    schemaVersion: { const: MIGRATE_TO_VITE_PLAN_SCHEMA_VERSION },
+    schemaVersion: { type: "string", const: MIGRATE_TO_VITE_PLAN_SCHEMA_VERSION },
     title: { type: "string" },
     summary: { type: "string" },
     applicability: {
@@ -216,6 +219,7 @@ export const MIGRATE_TO_VITE_PLAN_V1_SCHEMA = {
       required: ["status", "rationale", "evidence"],
       properties: {
         status: {
+          type: "string",
           enum: ["applicable", "already-vite", "not-applicable", "uncertain"],
         },
         rationale: { type: "string" },
@@ -228,6 +232,7 @@ export const MIGRATE_TO_VITE_PLAN_V1_SCHEMA = {
             properties: {
               relativePath: { type: "string" },
               kind: {
+                type: "string",
                 enum: [
                   "config-file",
                   "dependency",
@@ -255,8 +260,8 @@ export const MIGRATE_TO_VITE_PLAN_V1_SCHEMA = {
         "environmentVariableNames",
       ],
       properties: {
-        projectType: { enum: PROJECT_TYPES },
-        packageManager: { enum: PACKAGE_MANAGERS },
+        projectType: { type: "string", enum: PROJECT_TYPES },
+        packageManager: { type: "string", enum: PACKAGE_MANAGERS },
         frameworks: { type: "array", items: { type: "string" } },
         languages: { type: "array", items: { type: "string" } },
         legacyToolchain: { type: "array", items: { type: "string" } },
@@ -281,7 +286,7 @@ export const MIGRATE_TO_VITE_PLAN_V1_SCHEMA = {
           id: { type: "string" },
           responsibility: { type: "string" },
           currentEvidence: { type: "array", items: evidenceSchema },
-          disposition: { enum: DISPOSITIONS },
+          disposition: { type: "string", enum: DISPOSITIONS },
           viteReplacement: { type: ["string", "null"] },
           risks: { type: "array", items: { type: "string" } },
         },

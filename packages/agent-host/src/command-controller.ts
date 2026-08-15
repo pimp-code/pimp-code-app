@@ -1,6 +1,6 @@
-import { startAgentRun, type ActiveRun } from "./agent-runner.js";
+import { startAgentRun } from "./agent-runner.js";
 import { startPlanRun } from "./plan-runner.js";
-import type { HostEvent, RunCommand } from "./protocol.js";
+import type { ActiveRun, HostEvent, RunCommand } from "./protocol.js";
 import { parseHostCommand, validateRunCommand } from "./validation.js";
 
 interface PendingRun {

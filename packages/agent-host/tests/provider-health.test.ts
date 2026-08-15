@@ -128,3 +128,30 @@ test("Claude health reports credential presence and labels aliases as static", a
     else process.env.ANTHROPIC_API_KEY = previous;
   }
 });
+
+test("Codex health requires OpenAI credentials and verifies the local SDK runtime", async () => {
+  const previous = process.env.OPENAI_API_KEY;
+  try {
+    delete process.env.OPENAI_API_KEY;
+    const unavailable = await checkProviderHealth({
+      kind: "codex",
+      model: "gpt-5.6-terra",
+    });
+    assert.equal(unavailable.healthy, false);
+    assert.match(unavailable.message, /OPENAI_API_KEY/u);
+
+    process.env.OPENAI_API_KEY = "codex-provider-health-test-key";
+    const ready = await checkProviderHealth({
+      kind: "codex",
+      model: "gpt-5.6-terra",
+    });
+    assert.equal(ready.healthy, true);
+    assert.equal(ready.status, "ready");
+    assert.equal(ready.discovery, "static-aliases");
+    assert.ok(ready.models.some((model) => model.id === "gpt-5.6-terra"));
+    assert.ok(!ready.message.includes("codex-provider-health-test-key"));
+  } finally {
+    if (previous === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previous;
+  }
+});
