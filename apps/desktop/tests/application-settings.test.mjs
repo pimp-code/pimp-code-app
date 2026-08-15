@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizeApplicationSettings } from "../src/contracts.ts";
+import {
+  normalizeApplicationSettings,
+  normalizeJobStore,
+  normalizeProviderProfileSettings,
+} from "../src/contracts.ts";
 
 test("normalizes persisted job-retention settings", () => {
   assert.deepEqual(
@@ -57,4 +61,35 @@ test("preserves a count-only policy when age is null", () => {
       maxAgeDays: undefined,
     },
   );
+});
+
+test("preserves Codex provider profiles and durable-job snapshots", () => {
+  const profile = normalizeProviderProfileSettings({
+    version: 1,
+    profiles: [{
+      id: "profile-id",
+      name: "Codex API",
+      kind: "codex",
+      defaultModel: "gpt-5.6-terra",
+      revision: 1,
+    }],
+  }).profiles[0];
+  assert.equal(profile?.kind, "codex");
+
+  const job = normalizeJobStore({
+    version: 1,
+    jobs: [{
+      id: "job-id",
+      projectId: "project-id",
+      skillId: "skill-id",
+      provider: {
+        profileId: "profile-id",
+        profileName: "Codex API",
+        profileRevision: 1,
+        kind: "codex",
+        model: "gpt-5.6-terra",
+      },
+    }],
+  }).jobs[0];
+  assert.equal(job?.provider?.kind, "codex");
 });

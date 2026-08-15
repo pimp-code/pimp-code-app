@@ -227,7 +227,7 @@ async function preparePlanningPreflight(
     },
     remoteEgress: {
       required: true,
-      destination: "Anthropic / Claude",
+      destination: "Selected remote provider",
       contextHash: preflight.context.manifest.manifestSha256,
     },
     warnings: preflight.context.manifest.excluded.slice(0, 100).map((item) => ({

@@ -13,5 +13,17 @@
     "sdkVersion": "0.3.227",
     "binaryVersion": "2.1.227",
     "windowsX64Sha256": "a5d8bcc6549cf99a2ea35451f8034a12f0db919e63334477c72d42fc8e0d5c09"
+  },
+  "codex": {
+    "sdkVersion": "0.147.0",
+    "binaryVersion": "0.147.0-win32-x64",
+    "windowsX64Files": {
+      "codex-package.json": "ff573dd4c010f62fb40e3ed64c710622cf990b7b0a2be4bf20ff1d1f7b7c59b5",
+      "bin/codex-code-mode-host.exe": "37c23a542037e1bcfd0fa7eb4a150c697229d7ff31bf675c519d5bff7226b191",
+      "bin/codex.exe": "935a1911ed2556e4ffcec995f4886ac2ac425863ba26fed264df62e30272ad9d",
+      "codex-path/rg.exe": "14231169855ec5205cf5a1b6f1db358ff4aed4247c86b69ce8aae647c77f6680",
+      "codex-resources/codex-command-runner.exe": "3a70491d8d588afa459a42816f05b8c2fdd6bddb0ef318f3dfccc963a30b420a",
+      "codex-resources/codex-windows-sandbox-setup.exe": "a4df86996dfbb218d96d73a80606d89b742dfa4ddd3470614e90dde89e3250a3"
+    }
   }
 }

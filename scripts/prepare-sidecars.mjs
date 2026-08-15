@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  cp,
   copyFile,
   mkdir,
   readFile,
@@ -123,6 +124,42 @@ if (
 const claudeDestination = join(runtimeRoot, "claude.exe");
 await copyFile(claudeSource, claudeDestination);
 
+const codexSdkDirectory = join(workspace, "node_modules", "@openai", "codex-sdk");
+const codexPlatformDirectory = join(
+  workspace,
+  "node_modules",
+  "@openai",
+  "codex-win32-x64",
+);
+const codexSdkPackage = JSON.parse(
+  await readFile(join(codexSdkDirectory, "package.json"), "utf8"),
+);
+const codexPlatformPackage = JSON.parse(
+  await readFile(join(codexPlatformDirectory, "package.json"), "utf8"),
+);
+if (
+  codexSdkPackage.version !== lock.codex.sdkVersion ||
+  codexPlatformPackage.version !== lock.codex.binaryVersion
+) {
+  throw new Error("Installed Codex SDK does not match scripts/runtime-lock.json");
+}
+const codexSourceRoot = join(
+  codexPlatformDirectory,
+  "vendor",
+  "x86_64-pc-windows-msvc",
+);
+for (const [relativePath, checksum] of Object.entries(lock.codex.windowsX64Files)) {
+  await verify(
+    join(codexSourceRoot, ...relativePath.split("/")),
+    checksum,
+    `Codex ${lock.codex.sdkVersion} ${relativePath}`,
+  );
+}
+await cp(codexSourceRoot, join(runtimeRoot, "codex"), {
+  recursive: true,
+  force: true,
+});
+
 const bundleOptions = {
   banner: {
     js: 'import { createRequire as __pimpCreateRequire } from "node:module"; const require = __pimpCreateRequire(import.meta.url);',
@@ -153,6 +190,10 @@ await copyFile(
   join(runtimeRoot, "licenses", "claude-code-LICENSE.md"),
 );
 await copyFile(
+  join(codexSdkDirectory, "LICENSE"),
+  join(runtimeRoot, "licenses", "codex-sdk-LICENSE"),
+);
+await copyFile(
   join(sdkDirectory, "LICENSE.md"),
   join(runtimeRoot, "licenses", "claude-agent-sdk-LICENSE.md"),
 );
@@ -181,6 +222,8 @@ for (const relativePath of [
   "licenses/node-LICENSE.txt",
   "licenses/claude-code-LICENSE.md",
   "licenses/claude-agent-sdk-LICENSE.md",
+  "licenses/codex-sdk-LICENSE",
+  ...Object.keys(lock.codex.windowsX64Files).map((path) => `codex/${path}`),
 ]) {
   const path = join(runtimeRoot, relativePath);
   artifacts[relativePath] = {
@@ -197,6 +240,8 @@ await writeFile(
       nodeVersion: lock.node.version,
       claudeAgentSdkVersion: lock.claudeCode.sdkVersion,
       claudeCodeVersion: lock.claudeCode.binaryVersion,
+      codexSdkVersion: lock.codex.sdkVersion,
+      codexVersion: lock.codex.binaryVersion,
       artifacts,
     },
     null,

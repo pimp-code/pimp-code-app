@@ -3,71 +3,14 @@ import {
   type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { statSync } from "node:fs";
-import { isAbsolute } from "node:path";
-import type { HostEvent, StartCommand } from "./protocol.js";
+import { startCodexAgentRun } from "./codex-runner.js";
+import type { ActiveRun, HostEvent, StartCommand } from "./protocol.js";
 import { startLocalAnthropicBridge, type LocalBridge } from "./local-anthropic-bridge.js";
-
-const SAFE_ENV_KEYS = [
-  "APPDATA",
-  "COMSPEC",
-  "HOME",
-  "LOCALAPPDATA",
-  "PATH",
-  "PATHEXT",
-  "SYSTEMDRIVE",
-  "SYSTEMROOT",
-  "TEMP",
-  "TMP",
-  "USERPROFILE",
-  "WINDIR",
-] as const;
-
-export interface ActiveRun {
-  abort(): void;
-  done: Promise<void>;
-}
-
-export function configuredClaudeExecutable(): string | undefined {
-  const executable = process.env.PIMP_CLAUDE_CODE_PATH;
-  if (!executable) return undefined;
-  if (!isAbsolute(executable) || !statSync(executable).isFile()) {
-    throw new Error("The packaged Claude Code executable path is invalid");
-  }
-  return executable;
-}
-
-export function buildBaseEnvironment(): Record<string, string | undefined> {
-  const environment: Record<string, string | undefined> = {};
-  for (const key of SAFE_ENV_KEYS) {
-    if (process.env[key]) environment[key] = process.env[key];
-  }
-
-  return {
-    ...environment,
-    CLAUDE_AGENT_SDK_CLIENT_APP: "pimp-code-tauri-spike/0.0.0",
-    CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
-    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1",
-    CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
-    CLAUDE_CODE_DISABLE_CRON: "1",
-    CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS: "1",
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-    CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
-    DISABLE_ERROR_REPORTING: "1",
-    DISABLE_TELEMETRY: "1",
-  };
-}
-
-export function redactDiagnostic(value: string): string {
-  let redacted = value;
-  for (const secret of [
-    process.env.ANTHROPIC_API_KEY,
-    process.env.LOCAL_LLM_API_KEY,
-  ]) {
-    if (secret) redacted = redacted.replaceAll(secret, "[REDACTED]");
-  }
-  return redacted.slice(0, 4_000);
-}
+import {
+  buildClaudeEnvironment,
+  configuredClaudeExecutable,
+  redactDiagnostic,
+} from "./runtime-environment.js";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null
@@ -174,6 +117,9 @@ export function startAgentRun(
   command: StartCommand,
   emit: (event: HostEvent) => void,
 ): ActiveRun {
+  if (command.provider.kind === "codex") {
+    return startCodexAgentRun(command, emit);
+  }
   const abortController = new AbortController();
   let cancelled = false;
 
@@ -189,14 +135,14 @@ export function startAgentRun(
     };
 
     try {
-      const environment = buildBaseEnvironment();
+      const environment = buildClaudeEnvironment();
       if (command.provider.kind === "claude") {
         const apiKey = process.env.ANTHROPIC_API_KEY;
         if (!apiKey) {
           throw new Error("ANTHROPIC_API_KEY is required for the Claude profile");
         }
         environment.ANTHROPIC_API_KEY = apiKey;
-      } else {
+      } else if (command.provider.kind === "local") {
         bridge = await startLocalAnthropicBridge({
           endpoint: command.provider.endpoint,
           model: command.provider.model,
@@ -208,6 +154,8 @@ export function startAgentRun(
         environment.ANTHROPIC_MODEL = command.provider.model;
         environment.ANTHROPIC_CUSTOM_MODEL_OPTION = command.provider.model;
         environment.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS = "1";
+      } else {
+        throw new Error("Unsupported provider for the Claude runner");
       }
 
       emit({

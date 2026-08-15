@@ -97,24 +97,24 @@ const applicabilityEvidenceSchema = strictObject(
   ["relativePath", "kind", "fact"],
   {
     relativePath: { type: "string" },
-    kind: { enum: EVIDENCE_KINDS },
+    kind: { type: "string", enum: EVIDENCE_KINDS },
     fact: { type: "string" },
   },
 );
 const versionSchema = strictObject(
   ["packageName", "version", "major", "source", "kind"],
   {
-    packageName: { enum: ["react-router", "react-router-dom"] },
+    packageName: { type: "string", enum: ["react-router", "react-router-dom"] },
     version: { type: "string" },
     major: { type: "integer", minimum: 0 },
     source: { type: "string" },
-    kind: { enum: VERSION_KINDS },
+    kind: { type: "string", enum: VERSION_KINDS },
   },
 );
 const applicabilitySchema = strictObject(
   ["status", "rationale", "versions", "legacyApis", "evidence"],
   {
-    status: { enum: APPLICABILITY_STATUSES },
+    status: { type: "string", enum: APPLICABILITY_STATUSES },
     rationale: { type: "string" },
     versions: { type: "array", items: versionSchema },
     legacyApis: { type: "array", items: { type: "string" } },
@@ -124,9 +124,9 @@ const applicabilitySchema = strictObject(
 const actionSchema = strictObject(
   ["kind", "subject", "action", "description"],
   {
-    kind: { enum: ACTION_KINDS },
+    kind: { type: "string", enum: ACTION_KINDS },
     subject: { type: "string" },
-    action: { enum: ACTIONS },
+    action: { type: "string", enum: ACTIONS },
     description: { type: "string" },
   },
 );
@@ -161,7 +161,7 @@ const verificationSchema = strictObject(
     args: { type: "array", items: { type: "string" } },
     purpose: { type: "string" },
     expectedOutcome: { type: "string" },
-    requiresApproval: { const: true },
+    requiresApproval: { type: "boolean", const: true },
   },
 );
 
@@ -171,14 +171,17 @@ export const UPGRADE_REACT_ROUTER_TO_V8_PLAN_V1_SCHEMA = strictObject(
     "routeParity", "migrationSteps", "verification", "assumptions", "risks", "followUps", "filesInspected",
   ],
   {
-    schemaVersion: { const: UPGRADE_REACT_ROUTER_TO_V8_PLAN_SCHEMA_VERSION },
+    schemaVersion: {
+      type: "string",
+      const: UPGRADE_REACT_ROUTER_TO_V8_PLAN_SCHEMA_VERSION,
+    },
     title: { type: "string" },
     summary: { type: "string" },
     applicability: applicabilitySchema,
     inventory: strictObject(
       ["routerMode", "currentVersions", "legacyApis", "routerFiles", "testFiles", "deploymentFiles"],
       {
-        routerMode: { enum: ROUTER_MODES },
+        routerMode: { type: "string", enum: ROUTER_MODES },
         currentVersions: { type: "array", items: versionSchema },
         legacyApis: { type: "array", items: { type: "string" } },
         routerFiles: { type: "array", items: { type: "string" } },

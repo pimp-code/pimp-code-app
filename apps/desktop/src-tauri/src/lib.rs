@@ -78,6 +78,7 @@ struct AgentStartRequest {
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum ProviderConfig {
     Claude { model: String },
+    Codex { model: String },
     Local { model: String, endpoint: String },
 }
 
@@ -228,6 +229,26 @@ fn claude_runtime_path(app: &AppHandle) -> Result<Option<PathBuf>, String> {
     }
 }
 
+fn codex_runtime_path(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    #[cfg(debug_assertions)]
+    {
+        let _ = app;
+        Ok(None)
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let path = app
+            .path()
+            .resource_dir()
+            .map_err(|error| format!("Could not resolve packaged resources: {error}"))?
+            .join("runtime/codex/bin/codex.exe")
+            .canonicalize()
+            .map_err(|error| format!("Packaged Codex runtime is unavailable: {error}"))?;
+        Ok(Some(node_compatible_path(&path)))
+    }
+}
+
 fn runtime_working_directory(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
@@ -270,7 +291,7 @@ fn minimal_environment() -> HashMap<String, String> {
 
 fn redact_host_credentials(message: impl Into<String>) -> String {
     let mut result = message.into();
-    for key in ["ANTHROPIC_API_KEY", "LOCAL_LLM_API_KEY"] {
+    for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "LOCAL_LLM_API_KEY"] {
         if let Ok(secret) = std::env::var(key)
             && !secret.is_empty()
         {
@@ -377,6 +398,7 @@ fn provider_profiles_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn provider_environment_key(kind: ProviderProfileKind) -> &'static str {
     match kind {
         ProviderProfileKind::Claude => "ANTHROPIC_API_KEY",
+        ProviderProfileKind::Codex => "OPENAI_API_KEY",
         ProviderProfileKind::Local => "LOCAL_LLM_API_KEY",
     }
 }
@@ -395,6 +417,7 @@ fn validate_provider_config(
 ) -> Result<(), String> {
     let matches = match (&profile.kind, provider) {
         (ProviderProfileKind::Claude, ProviderConfig::Claude { .. }) => true,
+        (ProviderProfileKind::Codex, ProviderConfig::Codex { .. }) => true,
         (ProviderProfileKind::Local, ProviderConfig::Local { endpoint, .. }) => {
             profile.endpoint.as_deref() == Some(endpoint.trim())
         }
@@ -914,6 +937,7 @@ fn validate_job_provider_snapshot(
     let kind_matches = matches!(
         (&profile.kind, snapshot.kind),
         (ProviderProfileKind::Claude, JobProviderKind::Claude)
+            | (ProviderProfileKind::Codex, JobProviderKind::Codex)
             | (ProviderProfileKind::Local, JobProviderKind::Local)
     );
     if profile.revision != snapshot.profile_revision
@@ -1027,6 +1051,9 @@ async fn run_agent_utility(
         .kill_on_drop(true);
     if let Some(credential) = credential.as_ref() {
         command.env(credential.environment_key, credential.secret.as_str());
+    }
+    if let Some(path) = codex_runtime_path(app)? {
+        command.env("PIMP_CODEX_PATH", path);
     }
     let mut child = command
         .spawn()
@@ -1339,6 +1366,7 @@ async fn spawn_agent_host(
     let host_script = host_script_path(&app)?;
     let node_runtime = node_runtime_path(&app)?;
     let claude_runtime = claude_runtime_path(&app)?;
+    let codex_runtime = codex_runtime_path(&app)?;
     let runtime_directory = runtime_working_directory(&app)?;
     let mut command = Command::new(node_runtime);
     command
@@ -1355,6 +1383,9 @@ async fn spawn_agent_host(
     }
     if let Some(path) = claude_runtime {
         command.env("PIMP_CLAUDE_CODE_PATH", path);
+    }
+    if let Some(path) = codex_runtime {
+        command.env("PIMP_CODEX_PATH", path);
     }
 
     let mut child = command
@@ -1539,14 +1570,15 @@ async fn start_plan(
     }
     let (model, job_provider_kind) = match &request.provider {
         ProviderConfig::Claude { model } => (model.trim().to_string(), JobProviderKind::Claude),
+        ProviderConfig::Codex { model } => (model.trim().to_string(), JobProviderKind::Codex),
         ProviderConfig::Local { model, .. } => (model.trim().to_string(), JobProviderKind::Local),
     };
     if model.is_empty() || model.len() > 200 || model.chars().any(char::is_control) {
         return Err("A valid provider model is required".to_string());
     }
-    if matches!(&request.provider, ProviderConfig::Claude { .. }) && !request.remote_egress_approved
+    if !matches!(&request.provider, ProviderConfig::Local { .. }) && !request.remote_egress_approved
     {
-        return Err("Explicit remote-egress approval is required for Claude".to_string());
+        return Err("Explicit remote-egress approval is required for remote providers".to_string());
     }
 
     let preflight_root = app
@@ -1738,8 +1770,9 @@ pub fn run() {
 mod tests {
     use super::{
         ResolvedCredential, minimal_environment, node_compatible_path,
-        prepare_plan_utility_request, sanitize_provider_value,
+        prepare_plan_utility_request, provider_environment_key, sanitize_provider_value,
     };
+    use crate::settings::ProviderProfileKind;
     use serde_json::json;
     use std::{
         path::{Path, PathBuf},
@@ -1788,7 +1821,16 @@ mod tests {
     fn base_child_environment_excludes_all_provider_credentials() {
         let environment = minimal_environment();
         assert!(!environment.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!environment.contains_key("OPENAI_API_KEY"));
         assert!(!environment.contains_key("LOCAL_LLM_API_KEY"));
+    }
+
+    #[test]
+    fn codex_profiles_receive_only_the_openai_api_key() {
+        assert_eq!(
+            provider_environment_key(ProviderProfileKind::Codex),
+            "OPENAI_API_KEY"
+        );
     }
 
     #[test]

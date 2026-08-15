@@ -49,6 +49,7 @@ pub enum JobStatus {
 #[serde(rename_all = "lowercase")]
 pub enum JobProviderKind {
     Claude,
+    Codex,
     Local,
 }
 
@@ -178,10 +179,10 @@ fn validate_provider(provider: &JobProviderSnapshot) -> Result<(), String> {
             provider.endpoint.as_deref().unwrap_or_default(),
             "Local provider endpoint",
         ),
-        JobProviderKind::Claude if provider.endpoint.is_some() => {
-            Err("Claude job snapshots cannot contain a custom endpoint".to_string())
+        JobProviderKind::Claude | JobProviderKind::Codex if provider.endpoint.is_some() => {
+            Err("Remote-provider job snapshots cannot contain a custom endpoint".to_string())
         }
-        JobProviderKind::Claude => Ok(()),
+        JobProviderKind::Claude | JobProviderKind::Codex => Ok(()),
     }
 }
 

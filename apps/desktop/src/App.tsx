@@ -323,6 +323,8 @@ export function App() {
     () =>
       providerKind === "claude"
         ? { kind: "claude", model: model.trim() }
+        : providerKind === "codex"
+          ? { kind: "codex", model: model.trim() }
         : {
             kind: "local",
             model: model.trim(),
@@ -333,7 +335,8 @@ export function App() {
 
   const preflightApplicable =
     preflight?.applicability.verdict === "applicable";
-  const needsClaudeApproval = providerKind === "claude";
+  const needsRemoteApproval = providerKind !== "local";
+  const effectiveMaxTurns = providerKind === "codex" ? 1 : maxTurns;
   const selectedLocalModelIsAvailable =
     providerKind !== "local" ||
     providerHealth?.models.some(
@@ -346,7 +349,7 @@ export function App() {
   const canCheckProvider =
     !checkingProvider &&
     selectedProviderProfile !== undefined &&
-    (providerKind === "claude" || endpoint.trim().length > 0);
+    (providerKind !== "local" || endpoint.trim().length > 0);
   const canPrepare =
     activeProject !== undefined &&
     activeJob !== undefined &&
@@ -372,7 +375,7 @@ export function App() {
     canonicalConfirmed &&
     providerReady &&
     model.trim().length > 0 &&
-    (!needsClaudeApproval || remoteEgressApproved) &&
+    (!needsRemoteApproval || remoteEgressApproved) &&
     !running;
 
   const addTimeline = useCallback(
@@ -1085,7 +1088,7 @@ export function App() {
         provider: snapshot,
         runMode: "plan",
         approvalMode: "guided",
-        maxTurns,
+        maxTurns: effectiveMaxTurns,
       },
     });
     const job = normalizeJobRecord(value);
@@ -1106,14 +1109,14 @@ export function App() {
     const timer = window.setTimeout(() => {
       const snapshot = providerSnapshot();
       if (!snapshot) return;
-      if (jobSetupMatches(activeJob, snapshot, maxTurns)) return;
+      if (jobSetupMatches(activeJob, snapshot, effectiveMaxTurns)) return;
       void invoke<unknown>("update_durable_job_setup", {
         request: {
           jobId: activeJob.id,
           provider: snapshot,
           runMode: "plan",
           approvalMode: "guided",
-          maxTurns,
+          maxTurns: effectiveMaxTurns,
         },
       })
         .then((value) => applyJobRecord(normalizeJobRecord(value)))
@@ -1129,7 +1132,7 @@ export function App() {
     activeJob?.id,
     activeJob?.status,
     applyJobRecord,
-    maxTurns,
+    effectiveMaxTurns,
     model,
     providerSnapshot,
     running,
@@ -1279,7 +1282,7 @@ export function App() {
     addTimeline(
       "Submitting plan-only run",
       "neutral",
-      `${maxTurns}-turn limit · ${preflight.contextManifest.files.length} approved files`,
+      `${effectiveMaxTurns}-turn limit · ${preflight.contextManifest.files.length} approved files`,
     );
 
     try {
@@ -1288,9 +1291,9 @@ export function App() {
           jobId: activeJob.id,
           preflightId: preflight.id,
           provider,
-          maxTurns,
+          maxTurns: effectiveMaxTurns,
           remoteEgressApproved:
-            providerKind === "claude" ? remoteEgressApproved : false,
+            providerKind !== "local" ? remoteEgressApproved : false,
         },
       });
       setRunId(response.runId);
@@ -1754,6 +1757,8 @@ export function App() {
                 <strong>
                   {selectedProviderProfile.kind === "claude"
                     ? "Claude profile"
+                    : selectedProviderProfile.kind === "codex"
+                      ? "Codex SDK profile"
                     : "Local compatibility profile"}
                 </strong>
                 {selectedProviderProfile.endpoint ? (
@@ -1781,7 +1786,11 @@ export function App() {
                     invalidatePreflight();
                   }}
                   placeholder={
-                    providerKind === "claude" ? "sonnet" : "Run health check"
+                    providerKind === "claude"
+                      ? "sonnet"
+                      : providerKind === "codex"
+                        ? "gpt-5.6-terra"
+                        : "Run health check"
                   }
                   spellCheck={false}
                 />
@@ -1801,7 +1810,8 @@ export function App() {
                   min={MIN_MAX_TURNS}
                   max={MAX_MAX_TURNS}
                   step={1}
-                  value={maxTurns}
+                  value={effectiveMaxTurns}
+                  disabled={providerKind === "codex"}
                   onChange={(event) => {
                     const value = Number(event.target.value);
                     setMaxTurns(
@@ -1815,6 +1825,9 @@ export function App() {
                     invalidatePreflight();
                   }}
                 />
+                {providerKind === "codex" ? (
+                  <small>Codex SDK completes each plan job as one SDK turn.</small>
+                ) : null}
               </label>
             </div>
 
@@ -2023,13 +2036,17 @@ export function App() {
                 )}
               </section>
 
-              {needsClaudeApproval ? (
+              {needsRemoteApproval ? (
                 <section className="egress-card" aria-labelledby="egress-heading">
                   <div>
                     <p className="eyebrow">Remote egress</p>
-                    <h3 id="egress-heading">Approval required for Claude</h3>
+                    <h3 id="egress-heading">
+                      Approval required for {providerKind === "codex" ? "Codex" : "Claude"}
+                    </h3>
                     <p>
-                      Destination: {preflight.remoteEgress.destination || "Claude provider"}.
+                      Destination: {providerKind === "codex"
+                        ? "OpenAI / Codex"
+                        : "Anthropic / Claude"}.
                       Only the files listed above and the immutable skill snapshot may
                       leave this machine.
                     </p>
@@ -2055,8 +2072,8 @@ export function App() {
                 </section>
               ) : (
                 <div className="local-egress-note">
-                  Local bridge target: <code>{endpoint}</code>. Claude remote-egress
-                  approval is not requested for this provider.
+                  Local bridge target: <code>{endpoint}</code>. Remote-egress approval
+                  is not requested for this provider.
                 </div>
               )}
 
@@ -2079,7 +2096,7 @@ export function App() {
                 </button>
               </div>
               <p className="safety-line">
-                Read files only · no writes · no repository commands · {maxTurns}-turn cap
+                Read files only · no writes · no repository commands · {effectiveMaxTurns}-turn cap
               </p>
             </div>
           )}

@@ -71,8 +71,8 @@ export function validateProviderConfig(
 ): ProviderConfig {
   const provider = requireObject(value, "provider");
   const kind = provider.kind;
-  if (kind !== "claude" && kind !== "local") {
-    throw new Error("provider.kind must be claude or local");
+  if (kind !== "claude" && kind !== "codex" && kind !== "local") {
+    throw new Error("provider.kind must be claude, codex, or local");
   }
 
   const model =
@@ -81,7 +81,7 @@ export function validateProviderConfig(
       : requireString(provider.model, "provider.model", {
           maxLength: MAX_MODEL_LENGTH,
         });
-  return kind === "claude"
+  return kind === "claude" || kind === "codex"
     ? { kind, model }
     : {
         kind,
@@ -164,8 +164,8 @@ export async function validateStartPlanCommand(
     throw new Error("remoteEgressApproved must be a boolean");
   }
   const provider = validateProviderConfig(command.provider);
-  if (provider.kind === "claude" && !command.remoteEgressApproved) {
-    throw new Error("Explicit remote-egress approval is required for Claude");
+  if (provider.kind !== "local" && !command.remoteEgressApproved) {
+    throw new Error("Explicit remote-egress approval is required for remote providers");
   }
 
   return {
